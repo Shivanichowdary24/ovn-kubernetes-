@@ -55,6 +55,21 @@ func TestCountBits(t *testing.T) {
 			n:        big.NewInt(0xaaaaaaaa),
 			expected: 16,
 		},
+		{
+			name:     "byte boundary bits",
+			n:        big.NewInt(0x0101010101),
+			expected: 5,
+		},
+		{
+			name:     "high bit in each byte",
+			n:        big.NewInt(0x8080808080),
+			expected: 5,
+		},
+		{
+			name:     "all bits across multiple bytes",
+			n:        new(big.Int).SetUint64(0xffffffffffffffff),
+			expected: 64,
+		},
 	}
 
 	for _, test := range tests {
