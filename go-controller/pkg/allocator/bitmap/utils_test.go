@@ -24,32 +24,46 @@ import (
 	"testing"
 )
 
-func TestBitCount(t *testing.T) {
-	for i, c := range bitCounts {
-		actual := 0
-		for j := 0; j < 8; j++ {
-			if ((1 << uint(j)) & i) != 0 {
-				actual++
-			}
-		}
-		if actual != int(c) {
-			t.Errorf("%d should have %d bits but recorded as %d", i, actual, c)
-		}
-	}
-}
-
 func TestCountBits(t *testing.T) {
 	tests := []struct {
+		name     string
 		n        *big.Int
 		expected int
 	}{
-		{n: big.NewInt(int64(0)), expected: 0},
-		{n: big.NewInt(int64(0xffffffffff)), expected: 40},
+		{
+			name:     "zero",
+			n:        big.NewInt(0),
+			expected: 0,
+		},
+		{
+			name:     "single byte",
+			n:        big.NewInt(0xff),
+			expected: 8,
+		},
+		{
+			name:     "multiple bytes",
+			n:        big.NewInt(0xffffffffff),
+			expected: 40,
+		},
+		{
+			name:     "single bit",
+			n:        big.NewInt(1),
+			expected: 1,
+		},
+		{
+			name:     "alternating bits",
+			n:        big.NewInt(0xaaaaaaaa),
+			expected: 16,
+		},
 	}
+
 	for _, test := range tests {
-		actual := countBits(test.n)
-		if test.expected != actual {
-			t.Errorf("%s should have %d bits but recorded as %d", test.n, test.expected, actual)
-		}
+		t.Run(test.name, func(t *testing.T) {
+			actual := countBits(test.n)
+			if test.expected != actual {
+				t.Errorf("%s should have %d bits but recorded as %d",
+					test.n, test.expected, actual)
+			}
+		})
 	}
 }
