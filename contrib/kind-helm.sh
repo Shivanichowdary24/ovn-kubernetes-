@@ -394,9 +394,19 @@ parse_args() {
             -ric | --run-in-container )           RUN_IN_CONTAINER=true
                                                   ;;
             -kc | --kubeconfig )                  shift
+                                                  if [[ -z "${1:-}" || "${1:-}" == -* ]]; then
+                                                    echo "Missing value for --kubeconfig" >&2
+                                                    usage
+                                                    exit 1
+                                                  fi
                                                   KUBECONFIG=$1
                                                   ;;
             --dpu-mode )                          shift
+                                                  if [[ -z "${1:-}" || "${1:-}" == -* ]]; then
+                                                    echo "Missing value for --dpu-mode" >&2
+                                                    usage
+                                                    exit 1
+                                                  fi
                                                   DPU_MODE=$1
                                                   if [[ "${DPU_MODE}" != "none" && "${DPU_MODE}" != "host" && "${DPU_MODE}" != "dpu" ]]; then
                                                     echo "Invalid --dpu-mode: ${DPU_MODE}. Expected one of: none, host, dpu"
