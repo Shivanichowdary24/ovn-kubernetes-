@@ -4,6 +4,7 @@
 package subnet
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/onsi/ginkgo/v2"
@@ -348,6 +349,108 @@ var _ = ginkgo.Describe("Subnet IP allocator operations", func() {
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		err = allocator.AllocateIPPerSubnet(subnetName, reservedIPs)
 		gomega.Expect(err).To(gomega.HaveOccurred())
+	})
+
+	ginkgo.It("conditionally releases an allocated IP when the predicate allows it", func() {
+		err := allocator.AddOrUpdateSubnet(SubnetConfig{
+			Name:    subnetName,
+			Subnets: ovntest.MustParseIPNets("10.1.1.0/24"),
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		ips := ovntest.MustParseIPNets("10.1.1.1/24")
+		err = allocator.AllocateIPPerSubnet(subnetName, ips)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		predicateCalled := false
+		released, err := allocator.ConditionalIPRelease(subnetName, ips, func() (bool, error) {
+			predicateCalled = true
+			return true, nil
+		})
+
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(released).To(gomega.BeTrue())
+		gomega.Expect(predicateCalled).To(gomega.BeTrue())
+	})
+
+	ginkgo.It("does not release an allocated IP when the predicate denies it", func() {
+		err := allocator.AddOrUpdateSubnet(SubnetConfig{
+			Name:    subnetName,
+			Subnets: ovntest.MustParseIPNets("10.1.1.0/24"),
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		ips := ovntest.MustParseIPNets("10.1.1.1/24")
+		err = allocator.AllocateIPPerSubnet(subnetName, ips)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		predicateCalled := false
+		released, err := allocator.ConditionalIPRelease(subnetName, ips, func() (bool, error) {
+			predicateCalled = true
+			return false, nil
+		})
+
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(released).To(gomega.BeFalse())
+		gomega.Expect(predicateCalled).To(gomega.BeTrue())
+
+		// ConditionalIPRelease only evaluates the predicate; it does not
+		// release the IP itself.
+		err = allocator.AllocateIPPerSubnet(subnetName, ips)
+		gomega.Expect(err).To(gomega.MatchError(ipam.ErrAllocated))
+	})
+
+	ginkgo.It("returns an error when the predicate fails", func() {
+		err := allocator.AddOrUpdateSubnet(SubnetConfig{
+			Name:    subnetName,
+			Subnets: ovntest.MustParseIPNets("10.1.1.0/24"),
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		ips := ovntest.MustParseIPNets("10.1.1.1/24")
+		err = allocator.AllocateIPPerSubnet(subnetName, ips)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		released, err := allocator.ConditionalIPRelease(subnetName, ips, func() (bool, error) {
+			return false, fmt.Errorf("predicate failed")
+		})
+
+		gomega.Expect(released).To(gomega.BeFalse())
+		gomega.Expect(err).To(gomega.MatchError("predicate failed"))
+	})
+
+	ginkgo.It("does not call the predicate for an unallocated IP", func() {
+		err := allocator.AddOrUpdateSubnet(SubnetConfig{
+			Name:    subnetName,
+			Subnets: ovntest.MustParseIPNets("10.1.1.0/24"),
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		ips := ovntest.MustParseIPNets("10.1.1.1/24")
+
+		predicateCalled := false
+		released, err := allocator.ConditionalIPRelease(subnetName, ips, func() (bool, error) {
+			predicateCalled = true
+			return true, nil
+		})
+
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(released).To(gomega.BeFalse())
+		gomega.Expect(predicateCalled).To(gomega.BeFalse())
+	})
+
+	ginkgo.It("does not call the predicate for a nonexistent subnet", func() {
+		ips := ovntest.MustParseIPNets("10.1.1.1/24")
+
+		predicateCalled := false
+		released, err := allocator.ConditionalIPRelease("nonexistent-subnet", ips, func() (bool, error) {
+			predicateCalled = true
+			return true, nil
+		})
+
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(released).To(gomega.BeFalse())
+		gomega.Expect(predicateCalled).To(gomega.BeFalse())
 	})
 
 })
