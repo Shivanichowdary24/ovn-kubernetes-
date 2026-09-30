@@ -1,0 +1,745 @@
+// SPDX-FileCopyrightText: Copyright The OVN-Kubernetes Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build linux
+// +build linux
+
+package node
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	nadfake "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/client/clientset/versioned/fake"
+	"github.com/stretchr/testify/mock"
+	"github.com/vishvananda/netlink"
+
+	corev1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes/fake"
+	"sigs.k8s.io/knftables"
+
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	adminpolicybasedrouteclient "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/adminpolicybasedroute/v1/apis/clientset/versioned/fake"
+	udnfakeclient "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/userdefinednetwork/v1/apis/clientset/versioned/fake"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/networkmanager"
+	nodenft "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/nftables"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/routemanager"
+	ovntest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing"
+	netlink_mocks "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing/mocks/github.com/vishvananda/netlink"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
+	utilMocks "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util/mocks"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+)
+
+func TestMasqueradeLinkOperationsAreSerialized(t *testing.T) {
+	if err := config.PrepareTestConfig(); err != nil {
+		t.Fatalf("failed to prepare test config: %v", err)
+	}
+	t.Cleanup(func() { _ = config.PrepareTestConfig() })
+	config.IPv4Mode = false
+	config.IPv6Mode = false
+
+	netlinkMock := new(utilMocks.NetLinkOps)
+	originalNetlinkOps := util.GetNetLinkOps()
+	util.SetNetLinkOpMockInst(netlinkMock)
+	t.Cleanup(func() { util.SetNetLinkOpMockInst(originalNetlinkOps) })
+
+	firstLink := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "br-a", Index: 1}}
+	secondLink := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "br-b", Index: 2}}
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	netlinkMock.On("LinkByName", "br-a").
+		Run(func(mock.Arguments) {
+			close(firstEntered)
+			<-releaseFirst
+		}).
+		Return(firstLink, nil).
+		Once()
+	netlinkMock.On("LinkSetUp", firstLink).Return(nil).Once()
+	netlinkMock.On("LinkByName", "br-b").
+		Run(func(mock.Arguments) { close(secondEntered) }).
+		Return(secondLink, nil).
+		Once()
+	netlinkMock.On("LinkSetUp", secondLink).Return(nil).Once()
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- setNodeMasqueradeIPOnExtBridge("br-a") }()
+	<-firstEntered
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- addHostMACBindings("br-b")
+	}()
+	<-secondStarted
+	enteredConcurrently := false
+	select {
+	case <-secondEntered:
+		enteredConcurrently = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("masquerade address operation failed: %v", err)
+	}
+	if !enteredConcurrently {
+		select {
+		case <-secondEntered:
+		case <-time.After(time.Second):
+			t.Fatal("masquerade neighbor operation did not run")
+		}
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("masquerade neighbor operation failed: %v", err)
+	}
+	if enteredConcurrently {
+		t.Fatal("masquerade address and neighbor operations ran concurrently")
+	}
+	netlinkMock.AssertExpectations(t)
+}
+
+func TestHostNetworkServiceOpenFlowsUsesGroupForMultipleHostNetworkTargetPorts(t *testing.T) {
+	if err := config.PrepareTestConfig(); err != nil {
+		t.Fatalf("failed to prepare test config: %v", err)
+	}
+
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "namespace1",
+			Name:      "service1",
+		},
+	}
+	npw := &nodePortWatcher{ofportPhys: "eth0"}
+	key := "NodePort_namespace1_service1_tcp_31111"
+
+	flows, groups := npw.hostNetworkServiceOpenFlows(
+		service,
+		key,
+		"0x123",
+		"tcp",
+		"in_port=eth0, tcp, tp_dst=31111",
+		"10.244.0.1",
+		util.LBEndpoints{
+			{Port: 8080, V4IPs: []string{"10.128.0.2"}},    // local OVN-networked endpoint, not a host DNAT target
+			{Port: 9090, V4IPs: []string{"192.168.18.15"}}, // local host-networked endpoint
+			{Port: 10090, V4IPs: []string{"192.168.18.15"}},
+		},
+		[]net.IP{net.ParseIP("192.168.18.15")},
+		"eth0",
+	)
+
+	groupID := hostNetworkServiceGroupID(key)
+	expectedGroup := fmt.Sprintf("group_id=%d,type=select,"+
+		"bucket=actions=ct(commit,zone=64003,nat(dst=10.244.0.1:9090),table=6),"+
+		"bucket=actions=ct(commit,zone=64003,nat(dst=10.244.0.1:10090),table=6)", groupID)
+	if len(groups) != 1 || groups[0] != expectedGroup {
+		t.Fatalf("unexpected groups: %#v", groups)
+	}
+	if len(flows) != 5 {
+		t.Fatalf("expected 5 flows, got %d: %#v", len(flows), flows)
+	}
+	expectedIngressFlow := fmt.Sprintf("cookie=0x123, priority=110, in_port=eth0, tcp, tp_dst=31111, actions=group:%d", groupID)
+	if flows[0] != expectedIngressFlow {
+		t.Fatalf("unexpected ingress flow: %q", flows[0])
+	}
+	for _, line := range append(flows, groups...) {
+		if strings.Contains(line, "10.244.0.1:8080") || strings.Contains(line, "tp_src=8080") {
+			t.Fatalf("non-host endpoint target port was programmed: %q", line)
+		}
+	}
+}
+
+// Note: Local mocks are used instead of FakeNetworkManager to test specific error conditions
+// (NotFound, InvalidPrimaryNetworkError) from GetActiveNetworkForNamespace. FakeNetworkManager
+// doesn't support error injection. And the tests here are not dependent on the methods that
+// FakeNetworkManager implements. If more node tests need this, we will enhance FakeNetworkManager.
+
+// mockNetworkManagerWithNamespaceNotFoundError simulates namespace deletion race condition
+type mockNetworkManagerWithNamespaceNotFoundError struct {
+	networkmanager.Interface
+}
+
+func (m *mockNetworkManagerWithNamespaceNotFoundError) GetPrimaryNADForNamespace(namespace string) (string, error) {
+	// Namespace absent from the informer cache (not proof of deletion).
+	return "", fmt.Errorf("failed to fetch namespace %q: %w", namespace,
+		apierrors.NewNotFound(corev1.Resource("namespaces"), namespace))
+}
+
+func (m *mockNetworkManagerWithNamespaceNotFoundError) GetActiveNetworkForNamespace(_ string) (util.NetInfo, error) {
+	return nil, fmt.Errorf("failed to get namespace %q: %w", "test-ns",
+		apierrors.NewNotFound(corev1.Resource("namespaces"), "test-ns"))
+}
+
+// mockNetworkManagerWithInvalidPrimaryNetworkError simulates UDN deletion scenario
+type mockNetworkManagerWithInvalidPrimaryNetworkError struct {
+	networkmanager.Interface
+}
+
+func (m *mockNetworkManagerWithInvalidPrimaryNetworkError) GetPrimaryNADForNamespace(_ string) (string, error) {
+	// just a trigger to ensure GetActiveNetworkForNamespace gets called
+	return types.DefaultNetworkName, nil
+}
+
+func (m *mockNetworkManagerWithInvalidPrimaryNetworkError) GetActiveNetworkForNamespace(namespace string) (util.NetInfo, error) {
+	return nil, util.NewInvalidPrimaryNetworkError(namespace)
+}
+
+// mockNetworkManagerWithError tests that non-graceful errors are properly propagated
+type mockNetworkManagerWithError struct {
+	networkmanager.Interface
+}
+
+func (m *mockNetworkManagerWithError) GetPrimaryNADForNamespace(_ string) (string, error) {
+	// just a trigger to ensure GetActiveNetworkForNamespace gets called
+	return types.DefaultNetworkName, nil
+}
+
+func (m *mockNetworkManagerWithError) GetActiveNetworkForNamespace(namespace string) (util.NetInfo, error) {
+	return nil, fmt.Errorf("network lookup failed for namespace %q", namespace)
+}
+
+// mockNetworkManagerWithInvalidPrimaryNetworkSkip simulates a namespace that
+// requires a primary UDN but is currently in invalid primary network state.
+type mockNetworkManagerWithInvalidPrimaryNetworkSkip struct {
+	networkmanager.Interface
+}
+
+func (m *mockNetworkManagerWithInvalidPrimaryNetworkSkip) GetPrimaryNADForNamespace(namespace string) (string, error) {
+	return "", util.NewInvalidPrimaryNetworkError(namespace)
+}
+
+func (m *mockNetworkManagerWithInvalidPrimaryNetworkSkip) GetActiveNetworkForNamespace(namespace string) (util.NetInfo, error) {
+	return nil, util.NewInvalidPrimaryNetworkError(namespace)
+}
+
+// mockNetworkManagerWithInactiveNode simulates a UDN where the node is inactive for the network.
+type mockNetworkManagerWithInactiveNode struct {
+	networkmanager.Interface
+}
+
+func (m *mockNetworkManagerWithInactiveNode) GetPrimaryNADForNamespace(_ string) (string, error) {
+	return "test-namespace/test-nad", nil
+}
+
+func (m *mockNetworkManagerWithInactiveNode) GetNetworkNameForNADKey(_ string) string {
+	return "test-udn"
+}
+
+func (m *mockNetworkManagerWithInactiveNode) NodeHasNetwork(_, _ string) bool {
+	return false
+}
+
+func (m *mockNetworkManagerWithInactiveNode) GetActiveNetworkForNamespace(_ string) (util.NetInfo, error) {
+	// New code paths resolve activity directly via GetActiveNetworkForNamespace.
+	// Returning nil netInfo means "network not active on this node".
+	return nil, nil
+}
+
+// mockNetworkManagerWithActiveUDN simulates a UDN active on this node.
+type mockNetworkManagerWithActiveUDN struct {
+	networkmanager.Interface
+	netInfo util.NetInfo
+}
+
+func (m *mockNetworkManagerWithActiveUDN) GetPrimaryNADForNamespace(_ string) (string, error) {
+	return "test-namespace/test-nad", nil
+}
+
+func (m *mockNetworkManagerWithActiveUDN) GetNetworkNameForNADKey(_ string) string {
+	return m.netInfo.GetNetworkName()
+}
+
+func (m *mockNetworkManagerWithActiveUDN) NodeHasNetwork(_, _ string) bool {
+	return true
+}
+
+func (m *mockNetworkManagerWithActiveUDN) GetActiveNetworkForNamespace(_ string) (util.NetInfo, error) {
+	return m.netInfo, nil
+}
+
+// verifyNFTablesRule checks if an nftables rule exists and asserts the expected state
+func verifyNFTablesRule(nft knftables.Interface, serviceIP string, servicePort, nodePort int32, shouldExist bool, message string) {
+	elements, err := nft.ListElements(context.Background(), "map", "nodeports-v4")
+	Expect(err).NotTo(HaveOccurred())
+
+	servicePortStr := fmt.Sprintf("%d", servicePort)
+	nodePortStr := fmt.Sprintf("%d", nodePort)
+
+	exists := false
+	for _, elem := range elements {
+		if elem.Key[0] == "tcp" && elem.Key[1] == nodePortStr && elem.Value[0] == serviceIP && elem.Value[1] == servicePortStr {
+			exists = true
+			break
+		}
+	}
+	if shouldExist {
+		Expect(exists).To(BeTrue(), message)
+	} else {
+		Expect(exists).To(BeFalse(), message)
+	}
+}
+
+// setupServiceAndEndpointSliceWithRules creates a service and endpoint slice, adds them to npw,
+// and verifies nftables rules are created. Returns the created endpoint slice.
+func setupServiceAndEndpointSliceWithRules(npw *nodePortWatcher, nft knftables.Interface, svcName, namespace, serviceIP, endpointIP string, servicePort, nodePort int32, annotations map[string]string) *discovery.EndpointSlice {
+	// Create service
+	service := newService(svcName, namespace, serviceIP,
+		[]corev1.ServicePort{{
+			Name:       "http",
+			Protocol:   corev1.ProtocolTCP,
+			Port:       servicePort,
+			TargetPort: intstr.FromInt(int(servicePort) + 8000), // e.g., 80 -> 8080
+			NodePort:   nodePort,
+		}},
+		corev1.ServiceTypeNodePort, nil, corev1.ServiceStatus{}, false, false)
+
+	// Create endpoint slice with endpoints
+	epPortName := "http"
+	epPortValue := servicePort + 8000 // Match targetPort
+	epPortProtocol := corev1.ProtocolTCP
+	epSlice := newEndpointSlice(
+		svcName,
+		namespace,
+		[]discovery.Endpoint{
+			{
+				Addresses: []string{endpointIP},
+			},
+		},
+		[]discovery.EndpointPort{
+			{
+				Name:     &epPortName,
+				Protocol: &epPortProtocol,
+				Port:     &epPortValue,
+			},
+		},
+	)
+
+	// Apply annotations if provided
+	if len(annotations) > 0 {
+		if epSlice.Annotations == nil {
+			epSlice.Annotations = make(map[string]string)
+		}
+		for k, v := range annotations {
+			epSlice.Annotations[k] = v
+		}
+	}
+
+	// Add service and endpoint slice
+	err := npw.AddService(service)
+	Expect(err).NotTo(HaveOccurred())
+
+	err = npw.AddEndpointSlice(epSlice)
+	Expect(err).NotTo(HaveOccurred())
+
+	// Verify nftables rules were created
+	verifyNFTablesRule(nft, serviceIP, servicePort, nodePort, true, "nftables rule should exist before deletion")
+
+	return epSlice
+}
+
+var _ = Describe("DeleteEndpointSlice", func() {
+	var (
+		fakeClient *util.OVNNodeClientset
+		watcher    *factory.WatchFactory
+		npw        *nodePortWatcher
+		nft        knftables.Interface
+	)
+
+	const (
+		nodeName      = "test-node"
+		testNamespace = "test-namespace"
+		testService   = "test-service"
+	)
+
+	BeforeEach(func() {
+		var err error
+		// Restore global default values before each test
+		Expect(config.PrepareTestConfig()).To(Succeed())
+		config.Gateway.Mode = config.GatewayModeLocal
+		config.IPv4Mode = true
+		config.IPv6Mode = false
+
+		fakeClient = &util.OVNNodeClientset{
+			KubeClient: fake.NewSimpleClientset(),
+		}
+		fakeClient.AdminPolicyRouteClient = adminpolicybasedrouteclient.NewSimpleClientset()
+		fakeClient.NetworkAttchDefClient = nadfake.NewSimpleClientset()
+		fakeClient.UserDefinedNetworkClient = udnfakeclient.NewSimpleClientset()
+
+		watcher, err = factory.NewNodeWatchFactory(fakeClient, nodeName)
+		Expect(err).NotTo(HaveOccurred())
+		err = watcher.Start()
+		Expect(err).NotTo(HaveOccurred())
+
+		// Initialize nodePortWatcher with default network manager
+		nft = nodenft.SetFakeNFTablesHelper()
+		npw = initFakeNodePortWatcher()
+		npw.watchFactory = watcher
+		npw.networkManager = networkmanager.Default().Interface()
+
+		// Initialize nodeIPManager (required for GetLocalEligibleEndpointAddresses)
+		k := &kube.Kube{KClient: fakeClient.KubeClient}
+		npw.nodeIPManager = newAddressManagerInternal(nodeName, k, nil, watcher, nil, nil, false)
+
+		// Since the tests here never call startNodePortWatcher(), we have to call
+		// initGatewayNFTables() ourselves to set up the sets, maps, etc.
+		err = initGatewayNFTables()
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	AfterEach(func() {
+		watcher.Shutdown()
+	})
+
+	Context("when UDN is deleted before processing endpoint slice", func() {
+		It("should execute delServiceRules and gracefully skip addServiceRules", func() {
+			// Setup service and endpoint slice with nftables rules
+			// Add UDN annotation to simulate a mirrored UDN EndpointSlice
+			epSlice := setupServiceAndEndpointSliceWithRules(npw, nft, testService, testNamespace, "10.96.0.2", "10.244.0.2", 80, 30081,
+				map[string]string{types.UserDefinedNetworkEndpointSliceAnnotation: "test-udn"})
+
+			// Replace network manager with one that returns InvalidPrimaryNetworkError
+			// This simulates UDN deletion scenario
+			npw.networkManager = &mockNetworkManagerWithInvalidPrimaryNetworkError{}
+
+			// Call DeleteEndpointSlice - should not return error
+			err := npw.DeleteEndpointSlice(epSlice)
+
+			// Should gracefully handle UDN deletion (no error)
+			Expect(err).NotTo(HaveOccurred())
+
+			// nftables rules should be deleted even when UDN is deleted
+			verifyNFTablesRule(nft, "10.96.0.2", 80, 30081, false, "nftables rule should be deleted even when UDN is deleted")
+		})
+	})
+
+	Context("when network lookup returns other errors", func() {
+		It("should execute delServiceRules but return error from network lookup", func() {
+			// Setup service and endpoint slice with nftables rules
+			epSlice := setupServiceAndEndpointSliceWithRules(npw, nft, testService, testNamespace, "10.96.0.3", "10.244.0.3", 80, 30082, nil)
+
+			// Replace network manager with one that returns a generic error
+			npw.networkManager = &mockNetworkManagerWithError{}
+
+			// Call DeleteEndpointSlice - should return error
+			err := npw.DeleteEndpointSlice(epSlice)
+
+			// Should return error for other types of failures
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("error getting active network"))
+			Expect(err.Error()).To(ContainSubstring(testNamespace))
+			Expect(err.Error()).To(ContainSubstring(testService))
+
+			// nftables rules should still be deleted even when error is returned
+			verifyNFTablesRule(nft, "10.96.0.3", 80, 30082, false, "nftables rule should be deleted even when error occurs")
+		})
+	})
+
+	Context("when service does not exist in cache", func() {
+		It("should return nil without error", func() {
+			// Create endpoint slice (but no service in cache)
+			epSlice := newEndpointSlice(testService, testNamespace, nil, nil)
+
+			// Call DeleteEndpointSlice when service not in cache
+			err := npw.DeleteEndpointSlice(epSlice)
+
+			// Should return nil (no-op when not in cache)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Context("when namespace is deleted before processing endpoint slice", func() {
+		It("should clean up old rules even when namespace is gone", func() {
+			// Setup service and endpoint slice with nftables rules
+			epSlice := setupServiceAndEndpointSliceWithRules(npw, nft, testService, testNamespace, "10.96.0.10", "10.244.0.5", 80, 30090, nil)
+
+			// Simulate namespace not found error
+			npw.networkManager = &mockNetworkManagerWithNamespaceNotFoundError{}
+			err := npw.DeleteEndpointSlice(epSlice)
+			// Verify no error (graceful handling)
+			Expect(err).NotTo(HaveOccurred())
+
+			// nftables rules should be deleted even though namespace lookup failed
+			verifyNFTablesRule(nft, "10.96.0.10", 80, 30090, false, "nftables rule should be deleted even when namespace lookup fails")
+		})
+	})
+})
+
+var _ = Describe("SyncServices", func() {
+	var (
+		fakeClient *util.OVNNodeClientset
+		watcher    *factory.WatchFactory
+		npw        *nodePortWatcher
+		nft        knftables.Interface
+	)
+
+	const (
+		nodeName      = "test-node"
+		testNamespace = "test-namespace"
+		testService   = "test-service"
+	)
+
+	BeforeEach(func() {
+		var err error
+		Expect(config.PrepareTestConfig()).To(Succeed())
+		config.Gateway.Mode = config.GatewayModeLocal
+		config.IPv4Mode = true
+		config.IPv6Mode = false
+
+		fakeClient = &util.OVNNodeClientset{
+			KubeClient: fake.NewSimpleClientset(),
+		}
+		fakeClient.AdminPolicyRouteClient = adminpolicybasedrouteclient.NewSimpleClientset()
+		fakeClient.NetworkAttchDefClient = nadfake.NewSimpleClientset()
+		fakeClient.UserDefinedNetworkClient = udnfakeclient.NewSimpleClientset()
+
+		watcher, err = factory.NewNodeWatchFactory(fakeClient, nodeName)
+		Expect(err).NotTo(HaveOccurred())
+		err = watcher.Start()
+		Expect(err).NotTo(HaveOccurred())
+
+		nft = nodenft.SetFakeNFTablesHelper()
+		npw = initFakeNodePortWatcher()
+		npw.watchFactory = watcher
+		npw.networkManager = networkmanager.Default().Interface()
+
+		k := &kube.Kube{KClient: fakeClient.KubeClient}
+		npw.nodeIPManager = newAddressManagerInternal(nodeName, k, nil, watcher, nil, nil, false)
+
+		// Since the tests here never call startNodePortWatcher(), we have to call
+		// initGatewayNFTables() ourselves to set up the sets, maps, etc.
+		err = initGatewayNFTables()
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	AfterEach(func() {
+		watcher.Shutdown()
+	})
+
+	Context("when namespace has invalid primary network", func() {
+		It("should skip service sync without failing startup", func() {
+			service := newService(testService, testNamespace, "10.96.0.20",
+				[]corev1.ServicePort{{
+					Name:       "http",
+					Protocol:   corev1.ProtocolTCP,
+					Port:       80,
+					TargetPort: intstr.FromInt(8080),
+					NodePort:   30091,
+				}},
+				corev1.ServiceTypeNodePort, nil, corev1.ServiceStatus{}, false, false)
+
+			npw.networkManager = &mockNetworkManagerWithInvalidPrimaryNetworkSkip{}
+
+			err := npw.SyncServices([]interface{}{service})
+			Expect(err).NotTo(HaveOccurred())
+
+			verifyNFTablesRule(nft, "10.96.0.20", 80, 30091, false,
+				"nftables rule should not be created when primary network is invalid")
+		})
+	})
+
+	Context("when namespace is absent from informer cache", func() {
+		It("should skip service sync without failing startup", func() {
+			service := newService(testService, testNamespace, "10.96.0.21",
+				[]corev1.ServicePort{{
+					Name:       "http",
+					Protocol:   corev1.ProtocolTCP,
+					Port:       80,
+					TargetPort: intstr.FromInt(8080),
+					NodePort:   30094,
+				}},
+				corev1.ServiceTypeNodePort, nil, corev1.ServiceStatus{}, false, false)
+
+			npw.networkManager = &mockNetworkManagerWithNamespaceNotFoundError{}
+
+			err := npw.SyncServices([]interface{}{service})
+			Expect(err).NotTo(HaveOccurred())
+
+			verifyNFTablesRule(nft, "10.96.0.21", 80, 30094, false,
+				"nftables rule should not be created when namespace lookup returns NotFound")
+		})
+	})
+
+	Context("when UDN is inactive on this node", func() {
+		It("should skip service sync without installing rules", func() {
+			service := newService(testService, testNamespace, "10.96.0.30",
+				[]corev1.ServicePort{{
+					Name:       "http",
+					Protocol:   corev1.ProtocolTCP,
+					Port:       80,
+					TargetPort: intstr.FromInt(8080),
+					NodePort:   30092,
+				}},
+				corev1.ServiceTypeNodePort, nil, corev1.ServiceStatus{}, false, false)
+
+			npw.networkManager = &mockNetworkManagerWithInactiveNode{}
+
+			err := npw.SyncServices([]interface{}{service})
+			Expect(err).NotTo(HaveOccurred())
+
+			verifyNFTablesRule(nft, "10.96.0.30", 80, 30092, false,
+				"nftables rule should not be created when UDN is inactive on this node")
+		})
+	})
+
+	Context("when UDN is active on this node", func() {
+		It("should install nodeport rules", func() {
+			// Avoid openflow dependency in this test.
+			config.Gateway.AllowNoUplink = true
+			npw.ofportPhys = ""
+
+			service := newService(testService, testNamespace, "10.96.0.40",
+				[]corev1.ServicePort{{
+					Name:       "http",
+					Protocol:   corev1.ProtocolTCP,
+					Port:       80,
+					TargetPort: intstr.FromInt(8080),
+					NodePort:   30093,
+				}},
+				corev1.ServiceTypeNodePort, nil, corev1.ServiceStatus{}, false, false)
+
+			nad := ovntest.GenerateNAD("test-udn", "test-nad", testNamespace, types.Layer3Topology, "10.1.0.0/16", types.NetworkRolePrimary)
+			netInfo, err := util.ParseNADInfo(nad)
+			Expect(err).NotTo(HaveOccurred())
+			npw.networkManager = &mockNetworkManagerWithActiveUDN{netInfo: netInfo}
+
+			nodeName := npw.nodeIPManager.nodeName
+			epPortName := "http"
+			epPortValue := int32(8080)
+			epPortProtocol := corev1.ProtocolTCP
+			epSlice := &discovery.EndpointSlice{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testService + "ab23",
+					Namespace: testNamespace,
+					Labels: map[string]string{
+						types.LabelUserDefinedServiceName: testService,
+					},
+					Annotations: map[string]string{
+						types.UserDefinedNetworkEndpointSliceAnnotation: netInfo.GetNetworkName(),
+					},
+				},
+				AddressType: discovery.AddressTypeIPv4,
+				Endpoints: []discovery.Endpoint{{
+					Addresses: []string{"10.244.0.9"},
+					NodeName:  &nodeName,
+				}},
+				Ports: []discovery.EndpointPort{{
+					Name:     &epPortName,
+					Protocol: &epPortProtocol,
+					Port:     &epPortValue,
+				}},
+			}
+			Expect(watcher.EndpointSliceInformer().GetStore().Add(epSlice)).To(Succeed())
+
+			err = npw.SyncServices([]interface{}{service})
+			Expect(err).NotTo(HaveOccurred())
+
+			verifyNFTablesRule(nft, "10.96.0.40", 80, 30093, true,
+				"nftables rule should be created when UDN is active on this node")
+		})
+	})
+})
+
+var _ = Describe("masqueradeReconciler", func() {
+	var (
+		netlinkMock *utilMocks.NetLinkOps
+		rm          *routemanager.Controller
+		wf          factory.NodeWatchFactory
+	)
+
+	BeforeEach(func() {
+		netlinkMock = new(utilMocks.NetLinkOps)
+		util.SetNetLinkOpMockInst(netlinkMock)
+		rm = routemanager.NewController()
+		fakeClient := fake.NewSimpleClientset()
+		var err error
+		wf, err = factory.NewNodeWatchFactory(&util.OVNNodeClientset{KubeClient: fakeClient}, "node1")
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	AfterEach(func() {
+		util.ResetNetLinkOpMockInst()
+		wf.Shutdown()
+	})
+
+	It("skips reconciliation when interface name is empty", func() {
+		config.Gateway.Interface = ""
+		r := &masqueradeReconciler{nodeName: "node1", routeManager: rm, watchFactory: wf}
+		err := r.ensure()
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("returns error when interface does not exist", func() {
+		config.Gateway.Interface = "nonexistent0"
+		r := &masqueradeReconciler{nodeName: "node1", routeManager: rm, watchFactory: wf}
+		netlinkMock.On("LinkByName", "nonexistent0").Return(nil, fmt.Errorf("no such network interface"))
+		err := r.ensure()
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("interface nonexistent0 not found"))
+	})
+
+	It("skips reconciliation when mutex is already held", func() {
+		config.Gateway.Interface = "breth0"
+		r := &masqueradeReconciler{nodeName: "node1", routeManager: rm, watchFactory: wf}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		err := r.ensure()
+		Expect(err).NotTo(HaveOccurred())
+		netlinkMock.AssertNotCalled(GinkgoT(), "LinkByName")
+	})
+
+	It("reads config.Gateway.Interface at call time, not at construction", func() {
+		config.Gateway.Interface = "placeholder"
+		r := &masqueradeReconciler{nodeName: "node1", routeManager: rm, watchFactory: wf}
+
+		netlinkMock.On("LinkByName", "placeholder").Return(nil, fmt.Errorf("no such device"))
+		netlinkMock.On("LinkByName", "resolved0").Return(nil, fmt.Errorf("no such device"))
+
+		err := r.ensure()
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("interface placeholder not found"))
+
+		config.Gateway.Interface = "resolved0"
+		err = r.ensure()
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("interface resolved0 not found"))
+	})
+
+	It("takes fast path when link index matches and masquerade IP is present", func() {
+		Expect(config.PrepareTestConfig()).To(Succeed())
+		config.IPv4Mode = true
+		config.IPv6Mode = false
+		config.Gateway.Interface = "breth0"
+
+		linkMock := new(netlink_mocks.Link)
+		linkMock.On("Attrs").Return(&netlink.LinkAttrs{Index: 10, Name: "breth0"})
+
+		_, masqSubnet, _ := net.ParseCIDR(config.Gateway.V4MasqueradeSubnet)
+		masqSubnet.IP = config.Gateway.MasqueradeIPs.V4HostMasqueradeIP
+		netlinkMock.On("LinkByName", "breth0").Return(linkMock, nil)
+		netlinkMock.On("AddrList", linkMock, netlink.FAMILY_V4).Return([]netlink.Addr{
+			{IPNet: masqSubnet},
+		}, nil)
+
+		r := &masqueradeReconciler{nodeName: "node1", routeManager: rm, watchFactory: wf, lastLinkIndex: 10}
+		err := r.ensure()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(r.lastLinkIndex).To(Equal(10))
+	})
+})

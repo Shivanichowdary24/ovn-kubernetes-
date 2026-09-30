@@ -1,0 +1,4408 @@
+// SPDX-FileCopyrightText: Copyright The OVN-Kubernetes Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package services
+
+import (
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	corev1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
+
+	globalconfig "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	kubetest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
+)
+
+var (
+	defaultNodes = []nodeInfo{
+		{
+			name:               nodeA,
+			l3gatewayAddresses: []net.IP{net.ParseIP("10.0.0.1")},
+			hostAddresses:      []net.IP{net.ParseIP("10.0.0.1")},
+			gatewayRouterName:  "gr-node-a",
+			switchName:         "switch-node-a",
+		},
+		{
+			name:               nodeB,
+			l3gatewayAddresses: []net.IP{net.ParseIP("10.0.0.2")},
+			hostAddresses:      []net.IP{net.ParseIP("10.0.0.2")},
+			gatewayRouterName:  "gr-node-b",
+			switchName:         "switch-node-b",
+		},
+	}
+
+	httpPortName  string = "http"
+	httpPortValue int32  = int32(80)
+)
+
+func newLBEndpointEntry(port int32, v4IPs, v6IPs []string) util.LBEndpointEntry {
+	if len(v4IPs) == 0 {
+		v4IPs = nil
+	}
+	if len(v6IPs) == 0 {
+		v6IPs = nil
+	}
+	return util.LBEndpointEntry{Port: port, V4IPs: v4IPs, V6IPs: v6IPs}
+}
+
+func getSampleService(publishNotReadyAddresses bool) *corev1.Service {
+	name := "service-test"
+	namespace := "test"
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       k8stypes.UID(namespace),
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			PublishNotReadyAddresses: publishNotReadyAddresses,
+		},
+	}
+}
+
+func getServicePort(name string, port int32, protocol corev1.Protocol) corev1.ServicePort {
+	return corev1.ServicePort{
+		Name:       name,
+		TargetPort: intstr.FromInt(int(port)),
+		Protocol:   protocol,
+	}
+}
+
+func getSampleServiceWithOnePort(name string, targetPort int32, protocol corev1.Protocol) *corev1.Service {
+	service := getSampleService(false)
+	service.Spec.Ports = []corev1.ServicePort{getServicePort(name, targetPort, protocol)}
+	return service
+}
+
+func getSampleServiceWithOnePortAndETPLocal(name string, targetPort int32, protocol corev1.Protocol) *corev1.Service {
+	service := getSampleServiceWithOnePort(name, targetPort, protocol)
+	service.Spec.Type = corev1.ServiceTypeLoadBalancer
+	service.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
+	return service
+}
+
+func getSampleServiceWithTwoPorts(name1, name2 string, targetPort1, targetPort2 int32, protocol1, protocol2 corev1.Protocol) *corev1.Service {
+	service := getSampleService(false)
+	service.Spec.Ports = []corev1.ServicePort{
+		getServicePort(name1, targetPort1, protocol1),
+		getServicePort(name2, targetPort2, protocol2)}
+	return service
+}
+
+func getSampleServiceWithTwoPortsAndETPLocal(name1, name2 string, targetPort1, targetPort2 int32, protocol1, protocol2 corev1.Protocol) *corev1.Service {
+	service := getSampleServiceWithTwoPorts(name1, name2, targetPort1, targetPort2, protocol1, protocol2)
+	service.Spec.Type = corev1.ServiceTypeLoadBalancer
+	service.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
+	return service
+}
+
+func getSampleServiceWithOnePortAndPublishNotReadyAddresses(name string, targetPort int32, protocol corev1.Protocol) *corev1.Service {
+	service := getSampleServiceWithOnePort(name, targetPort, protocol)
+	service.Spec.PublishNotReadyAddresses = true
+	return service
+}
+
+func Test_buildServiceLBConfigs(t *testing.T) {
+	oldClusterSubnet := globalconfig.Default.ClusterSubnets
+	oldGwMode := globalconfig.Gateway.Mode
+	defer func() {
+		globalconfig.Gateway.Mode = oldGwMode
+		globalconfig.Default.ClusterSubnets = oldClusterSubnet
+	}()
+	_, cidr4, _ := net.ParseCIDR("10.128.0.0/16")
+	_, cidr6, _ := net.ParseCIDR("fe00::/64")
+	globalconfig.Default.ClusterSubnets = []globalconfig.CIDRNetworkEntry{{CIDR: cidr4, HostSubnetLength: 26}, {CIDR: cidr6, HostSubnetLength: 26}}
+
+	// constants
+	serviceName := "foo"
+	ns := "testns"
+	portName := "port80"
+	portName1 := "port81"
+	inport := int32(80)
+	outport := int32(8080)
+	inport1 := int32(81)
+	outport1 := int32(8081)
+	outportstr := intstr.FromInt(int(outport))
+
+	// make slices
+	// nil slice = don't use this family
+	// empty slice = family is empty
+	makeSlices := func(v4ips, v6ips []string, proto corev1.Protocol) []*discovery.EndpointSlice {
+		out := []*discovery.EndpointSlice{}
+		if v4ips != nil && len(v4ips) == 0 {
+			out = append(out, &discovery.EndpointSlice{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      serviceName + "ab1",
+					Namespace: ns,
+					Labels:    map[string]string{discovery.LabelServiceName: serviceName},
+				},
+				Ports:       []discovery.EndpointPort{},
+				AddressType: discovery.AddressTypeIPv4,
+				Endpoints:   []discovery.Endpoint{},
+			})
+		} else if v4ips != nil {
+			out = append(out, &discovery.EndpointSlice{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      serviceName + "ab1",
+					Namespace: ns,
+					Labels:    map[string]string{discovery.LabelServiceName: serviceName},
+				},
+				Ports: []discovery.EndpointPort{{
+					Protocol: &proto,
+					Port:     &outport,
+					Name:     &portName,
+				}},
+				AddressType: discovery.AddressTypeIPv4,
+				Endpoints:   kubetest.MakeReadyEndpointList(nodeA, v4ips...),
+			})
+		}
+
+		if v6ips != nil && len(v6ips) == 0 {
+			out = append(out, &discovery.EndpointSlice{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      serviceName + "ab2",
+					Namespace: ns,
+					Labels:    map[string]string{discovery.LabelServiceName: serviceName},
+				},
+				Ports:       []discovery.EndpointPort{},
+				AddressType: discovery.AddressTypeIPv6,
+				Endpoints:   []discovery.Endpoint{},
+			})
+		} else if v6ips != nil {
+			out = append(out, &discovery.EndpointSlice{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      serviceName + "ab2",
+					Namespace: ns,
+					Labels:    map[string]string{discovery.LabelServiceName: serviceName},
+				},
+				Ports: []discovery.EndpointPort{{
+					Protocol: &proto,
+					Port:     &outport,
+					Name:     &portName,
+				}},
+				AddressType: discovery.AddressTypeIPv6,
+				Endpoints:   kubetest.MakeReadyEndpointList(nodeA, v6ips...),
+			})
+		}
+
+		return out
+	}
+
+	makeV4SliceWithEndpoints := func(proto corev1.Protocol, endpoints ...discovery.Endpoint) []*discovery.EndpointSlice {
+		e := &discovery.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      serviceName + "ab1",
+				Namespace: ns,
+				Labels:    map[string]string{discovery.LabelServiceName: serviceName},
+			},
+			Ports: []discovery.EndpointPort{{
+				Protocol: &proto,
+				Port:     &outport,
+				Name:     &portName,
+			}},
+			AddressType: discovery.AddressTypeIPv4,
+			Endpoints:   endpoints,
+		}
+		return []*discovery.EndpointSlice{e}
+	}
+
+	type args struct {
+		service *corev1.Service
+		slices  []*discovery.EndpointSlice
+	}
+	tests := []struct {
+		name string
+		args args
+
+		resultSharedGatewayCluster  []lbConfig
+		resultSharedGatewayTemplate []lbConfig
+		resultSharedGatewayNode     []lbConfig
+
+		resultLocalGatewayNode     []lbConfig
+		resultLocalGatewayTemplate []lbConfig
+		resultLocalGatewayCluster  []lbConfig
+
+		resultsSame bool //if true, then just use the SharedGateway results for the LGW test
+	}{
+		{
+			name: "v4 clusterip, one port, no endpoints",
+			args: args{
+				slices: makeSlices([]string{}, nil, corev1.ProtocolTCP),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:       corev1.ServiceTypeClusterIP,
+						ClusterIP:  "192.168.1.1",
+						ClusterIPs: []string{"192.168.1.1"},
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+						}},
+					},
+				},
+			},
+			resultSharedGatewayCluster: []lbConfig{{
+				vips:             []string{"192.168.1.1"},
+				protocol:         corev1.ProtocolTCP,
+				inport:           80,
+				clusterEndpoints: nil,
+				nodeEndpoints:    util.PortToLBEndpoints{},
+			}},
+			resultsSame: true,
+		},
+		{
+			name: "v4 clusterip, one port, endpoints",
+			args: args{
+				slices: makeSlices([]string{"10.128.0.2"}, nil, corev1.ProtocolTCP),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:       corev1.ServiceTypeClusterIP,
+						ClusterIP:  "192.168.1.1",
+						ClusterIPs: []string{"192.168.1.1"},
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+						}},
+					},
+				},
+			},
+			resultSharedGatewayCluster: []lbConfig{{
+				vips:             []string{"192.168.1.1"},
+				protocol:         corev1.ProtocolTCP,
+				inport:           inport,
+				clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+				nodeEndpoints:    util.PortToLBEndpoints{}, // service is not ETP=local or ITP=local, so nodeEndpoints is not filled out
+			}},
+			resultsSame: true,
+		},
+		{
+			name: "v4 type=LoadBalancer, ETP=local, one port, endpoints",
+			args: args{
+				slices: makeSlices([]string{"10.128.0.2"}, nil, corev1.ProtocolTCP),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:                  corev1.ServiceTypeLoadBalancer,
+						ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
+						ClusterIP:             "192.168.1.1",
+						ClusterIPs:            []string{"192.168.1.1"},
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+						}},
+					},
+				},
+			},
+			resultSharedGatewayCluster: []lbConfig{{
+				vips:             []string{"192.168.1.1"},
+				protocol:         corev1.ProtocolTCP,
+				inport:           inport,
+				clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+				nodeEndpoints: util.PortToLBEndpoints{ // service is ETP=local, so nodeEndpoints is filled out
+					nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})}},
+			}},
+			resultsSame: true,
+		},
+		{
+			name: "v4 clusterip, two tcp ports, two endpoints",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      serviceName + "ab1",
+							Namespace: ns,
+							Labels:    map[string]string{discovery.LabelServiceName: serviceName},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     &portName,
+								Protocol: &tcp,
+								Port:     &outport,
+							}, {
+								Name:     &portName1,
+								Protocol: &tcp,
+								Port:     &outport1,
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.128.0.2", "10.128.1.2"),
+					},
+				},
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:       corev1.ServiceTypeClusterIP,
+						ClusterIP:  "192.168.1.1",
+						ClusterIPs: []string{"192.168.1.1"},
+						Ports: []corev1.ServicePort{
+							{
+								Name:       portName,
+								Port:       inport,
+								Protocol:   corev1.ProtocolTCP,
+								TargetPort: outportstr,
+							},
+							{
+								Name:       portName1,
+								Port:       inport1,
+								Protocol:   corev1.ProtocolTCP,
+								TargetPort: intstr.FromInt(int(outport1)),
+							},
+						},
+					},
+				},
+			},
+			resultsSame: true,
+			resultSharedGatewayCluster: []lbConfig{
+				{
+					vips:             []string{"192.168.1.1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2", "10.128.1.2"}, []string{})},
+					nodeEndpoints:    util.PortToLBEndpoints{},
+				},
+				{
+					vips:             []string{"192.168.1.1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport1,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport1, []string{"10.128.0.2", "10.128.1.2"}, []string{})},
+					nodeEndpoints:    util.PortToLBEndpoints{},
+				},
+			},
+		},
+		{
+			name: "v4 clusterip, one tcp, one udp port, two endpoints",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      serviceName + "ab1",
+							Namespace: ns,
+							Labels:    map[string]string{discovery.LabelServiceName: serviceName},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     &portName,
+								Protocol: &tcp,
+								Port:     &outport,
+							}, {
+								Name:     &portName1,
+								Protocol: &udp,
+								Port:     &outport,
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.128.0.2", "10.128.1.2"),
+					},
+				},
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:       corev1.ServiceTypeClusterIP,
+						ClusterIP:  "192.168.1.1",
+						ClusterIPs: []string{"192.168.1.1"},
+						Ports: []corev1.ServicePort{
+							{
+								Name:       portName,
+								Port:       inport,
+								Protocol:   corev1.ProtocolTCP,
+								TargetPort: outportstr,
+							},
+							{
+								Name:       portName1,
+								Port:       inport,
+								Protocol:   corev1.ProtocolUDP,
+								TargetPort: intstr.FromInt(int(outport)),
+							},
+						},
+					},
+				},
+			},
+			resultsSame: true,
+			resultSharedGatewayCluster: []lbConfig{
+				{
+					vips:             []string{"192.168.1.1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2", "10.128.1.2"}, []string{})},
+					nodeEndpoints:    util.PortToLBEndpoints{},
+				},
+				{
+					vips:             []string{"192.168.1.1"},
+					protocol:         corev1.ProtocolUDP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2", "10.128.1.2"}, []string{})},
+					nodeEndpoints:    util.PortToLBEndpoints{},
+				},
+			},
+		},
+		{
+			name: "dual-stack clusterip, one port, endpoints",
+			args: args{
+				slices: makeSlices([]string{"10.128.0.2"}, []string{"fe00::1:1"}, corev1.ProtocolTCP),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:       corev1.ServiceTypeClusterIP,
+						ClusterIP:  "192.168.1.1",
+						ClusterIPs: []string{"192.168.1.1", "2002::1"},
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+						}},
+					},
+				},
+			},
+			resultsSame: true,
+			resultSharedGatewayCluster: []lbConfig{{
+				vips:             []string{"192.168.1.1", "2002::1"},
+				protocol:         corev1.ProtocolTCP,
+				inport:           inport,
+				clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{"fe00::1:1"})},
+				nodeEndpoints:    util.PortToLBEndpoints{},
+			}},
+		},
+		{
+			name: "dual-stack clusterip, one port, endpoints, external ips + lb status",
+			args: args{
+				slices: makeSlices([]string{"10.128.0.2"}, []string{"fe00::1:1"}, corev1.ProtocolTCP),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:       corev1.ServiceTypeLoadBalancer,
+						ClusterIP:  "192.168.1.1",
+						ClusterIPs: []string{"192.168.1.1", "2002::1"},
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+						}},
+						ExternalIPs: []string{"4.2.2.2", "42::42"},
+					},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{
+								IP: "5.5.5.5",
+							}},
+						},
+					},
+				},
+			},
+			resultsSame: true,
+			resultSharedGatewayCluster: []lbConfig{{
+				vips:             []string{"192.168.1.1", "2002::1", "4.2.2.2", "42::42", "5.5.5.5"},
+				protocol:         corev1.ProtocolTCP,
+				inport:           inport,
+				clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{"fe00::1:1"})},
+				nodeEndpoints:    util.PortToLBEndpoints{}, // ETP=cluster (default), so nodeEndpoints is not filled out
+			}},
+		},
+		{
+			name: "dual-stack clusterip, one port, endpoints, external ips + lb status, ExternalTrafficPolicy=local",
+			args: args{
+				slices: makeSlices([]string{"10.128.0.2"}, []string{"fe00::1:1"}, corev1.ProtocolTCP),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:                  corev1.ServiceTypeLoadBalancer,
+						ClusterIP:             "192.168.1.1",
+						ClusterIPs:            []string{"192.168.1.1", "2002::1"},
+						ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+						}},
+						ExternalIPs: []string{"4.2.2.2", "42::42"},
+					},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{
+								IP: "5.5.5.5",
+							}},
+						},
+					},
+				},
+			},
+			resultsSame: true,
+			resultSharedGatewayCluster: []lbConfig{
+				{
+					vips:             []string{"192.168.1.1", "2002::1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{"fe00::1:1"})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{"fe00::1:1"})}},
+				},
+			},
+			resultSharedGatewayNode: []lbConfig{
+				{
+					vips:                 []string{"4.2.2.2", "42::42", "5.5.5.5"},
+					protocol:             corev1.ProtocolTCP,
+					inport:               inport,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{"fe00::1:1"})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{"fe00::1:1"})}},
+				},
+			},
+		},
+		{
+			name: "dual-stack clusterip, one port, endpoints, nodePort",
+			args: args{
+				slices: makeSlices([]string{"10.128.0.2"}, []string{"fe00::1:1"}, corev1.ProtocolTCP),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:       corev1.ServiceTypeClusterIP,
+						ClusterIP:  "192.168.1.1",
+						ClusterIPs: []string{"192.168.1.1", "2002::1"},
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+							NodePort:   5,
+						}},
+					},
+				},
+			},
+			resultsSame: true,
+			resultSharedGatewayCluster: []lbConfig{{
+				vips:             []string{"192.168.1.1", "2002::1"},
+				protocol:         corev1.ProtocolTCP,
+				inport:           inport,
+				clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{"fe00::1:1"})},
+				nodeEndpoints:    util.PortToLBEndpoints{},
+			}},
+			resultSharedGatewayTemplate: []lbConfig{{
+				vips:             []string{"node"},
+				protocol:         corev1.ProtocolTCP,
+				inport:           5,
+				clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{"fe00::1:1"})},
+				nodeEndpoints:    util.PortToLBEndpoints{},
+				hasNodePort:      true,
+			}},
+		},
+		{
+			name: "dual-stack clusterip, one port, endpoints, nodePort, hostNetwork",
+			args: args{
+				// These slices are outside of the config, and thus are host network
+				slices: makeSlices([]string{"192.168.0.1"}, []string{"2001::1"}, corev1.ProtocolTCP),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:       corev1.ServiceTypeClusterIP,
+						ClusterIP:  "192.168.1.1",
+						ClusterIPs: []string{"192.168.1.1", "2002::1"},
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+							NodePort:   5,
+						}},
+					},
+				},
+			},
+			// In shared and local gateway modes, nodeport and host-network-pods must be per-node
+			resultSharedGatewayNode: []lbConfig{
+				{
+					vips:             []string{"192.168.1.1", "2002::1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})},
+					nodeEndpoints:    util.PortToLBEndpoints{},
+				},
+			},
+			resultSharedGatewayTemplate: []lbConfig{
+				{
+					vips:             []string{"node"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           5,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})},
+					nodeEndpoints:    util.PortToLBEndpoints{},
+					hasNodePort:      true,
+				},
+			},
+			// in local gateway mode, only nodePort is per-node
+			resultLocalGatewayNode: []lbConfig{
+				{
+					vips:             []string{"192.168.1.1", "2002::1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})},
+					nodeEndpoints:    util.PortToLBEndpoints{},
+				},
+			},
+			resultLocalGatewayTemplate: []lbConfig{
+				{
+					vips:             []string{"node"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           5,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})},
+					nodeEndpoints:    util.PortToLBEndpoints{},
+					hasNodePort:      true,
+				},
+			},
+		},
+		{
+			name: "dual-stack clusterip, one port, endpoints, nodePort, hostNetwork, ExternalTrafficPolicy=Local",
+			args: args{
+				// These slices are outside of the config, and thus are host network
+				slices: makeSlices([]string{"192.168.0.1"}, []string{"2001::1"}, corev1.ProtocolTCP),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:                  corev1.ServiceTypeNodePort,
+						ClusterIP:             "192.168.1.1",
+						ClusterIPs:            []string{"192.168.1.1", "2002::1"},
+						ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+							NodePort:   5,
+						}},
+					},
+				},
+			},
+			// In shared & local gateway modes, nodeport and host-network-pods must be per-node
+			resultSharedGatewayNode: []lbConfig{
+				{
+					vips:             []string{"node"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           5,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})}},
+					externalTrafficLocal: true,
+					hasNodePort:          true,
+				},
+				{
+					vips:             []string{"192.168.1.1", "2002::1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})}},
+				},
+			},
+			resultLocalGatewayNode: []lbConfig{
+				{
+					vips:             []string{"node"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           5,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})}},
+					externalTrafficLocal: true,
+					hasNodePort:          true,
+				},
+				{
+					vips:             []string{"192.168.1.1", "2002::1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})}},
+				},
+			},
+		},
+		{
+			name: "dual-stack clusterip, one port, endpoints, hostNetwork",
+			args: args{
+				// These slices are outside of the config, and thus are host network
+				slices: makeSlices([]string{"192.168.0.1"}, []string{"2001::1"}, corev1.ProtocolTCP),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:       corev1.ServiceTypeClusterIP,
+						ClusterIP:  "192.168.1.1",
+						ClusterIPs: []string{"192.168.1.1", "2002::1"},
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+						}},
+					},
+				},
+			},
+			// In shared gateway mode, nodeport and host-network-pods must be per-node
+			resultSharedGatewayNode: []lbConfig{
+				{
+					vips:             []string{"192.168.1.1", "2002::1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})},
+					nodeEndpoints:    util.PortToLBEndpoints{},
+				},
+			},
+			resultLocalGatewayNode: []lbConfig{
+				{
+					vips:             []string{"192.168.1.1", "2002::1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"192.168.0.1"}, []string{"2001::1"})},
+					nodeEndpoints:    util.PortToLBEndpoints{},
+				},
+			},
+		},
+		{
+			name: "LB service with NodePort, one port, two endpoints, external ips + lb status, ExternalTrafficPolicy=local",
+			args: args{
+				slices: makeV4SliceWithEndpoints(
+					corev1.ProtocolTCP,
+					kubetest.MakeReadyEndpoint(nodeA, "10.128.0.2"),
+					kubetest.MakeReadyEndpoint(nodeB, "10.128.1.2"),
+				),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:                  corev1.ServiceTypeLoadBalancer,
+						ClusterIP:             "192.168.1.1",
+						ClusterIPs:            []string{"192.168.1.1"},
+						ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+							NodePort:   5,
+						}},
+						ExternalIPs: []string{"4.2.2.2"},
+					},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{
+								IP: "5.5.5.5",
+							}},
+						},
+					},
+				},
+			},
+			resultsSame: true,
+			resultSharedGatewayCluster: []lbConfig{
+				{
+					vips:             []string{"192.168.1.1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2", "10.128.1.2"}, []string{})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+						nodeB: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.1.2"}, []string{})},
+					},
+				},
+			},
+			resultSharedGatewayNode: []lbConfig{
+				{
+					vips:                 []string{"node"},
+					protocol:             corev1.ProtocolTCP,
+					inport:               5,
+					hasNodePort:          true,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2", "10.128.1.2"}, []string{})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+						nodeB: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.1.2"}, []string{})},
+					},
+				},
+				{
+					vips:                 []string{"4.2.2.2", "5.5.5.5"},
+					protocol:             corev1.ProtocolTCP,
+					inport:               inport,
+					hasNodePort:          false,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2", "10.128.1.2"}, []string{})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+						nodeB: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.1.2"}, []string{})},
+					},
+				},
+			},
+		},
+		{
+			// The fallback to terminating&serving only if there are no ready endpoints
+			// is not done at this stage: we just include candidate endpoints, that is  ready + terminating&serving.
+			// The test below will just show both endpoints in its output.
+			name: "LB service with NodePort, port, two endpoints, external ips + lb status, ExternalTrafficPolicy=local, one endpoint is ready, the other one is terminating and serving",
+			args: args{
+				slices: makeV4SliceWithEndpoints(corev1.ProtocolTCP,
+					kubetest.MakeReadyEndpoint(nodeA, "10.128.0.2"),
+					kubetest.MakeTerminatingServingEndpoint(nodeB, "10.128.1.2")),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:                  corev1.ServiceTypeLoadBalancer,
+						ClusterIP:             "192.168.1.1",
+						ClusterIPs:            []string{"192.168.1.1"},
+						ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+							NodePort:   5,
+						}},
+						ExternalIPs: []string{"4.2.2.2"},
+					},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{
+								IP: "5.5.5.5",
+							}},
+						},
+					},
+				},
+			},
+			resultsSame: true,
+			resultSharedGatewayCluster: []lbConfig{
+				{
+					vips:             []string{"192.168.1.1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+						nodeB: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.1.2"}, []string{})},
+					},
+				},
+			},
+			resultSharedGatewayNode: []lbConfig{
+				{
+					vips:                 []string{"node"},
+					protocol:             corev1.ProtocolTCP,
+					inport:               5,
+					hasNodePort:          true,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+						nodeB: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.1.2"}, []string{})},
+					},
+				},
+				{
+					vips:                 []string{"4.2.2.2", "5.5.5.5"},
+					protocol:             corev1.ProtocolTCP,
+					inport:               inport,
+					hasNodePort:          false,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+						nodeB: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.1.2"}, []string{})},
+					},
+				},
+			},
+		},
+		{
+			// Terminating & non-serving endpoints are filtered out by buildServiceLBConfigs
+			name: "LB service with NodePort, one port, two endpoints, external ips + lb status, ExternalTrafficPolicy=local, both endpoints terminating: one is serving, the other one is not",
+			args: args{
+				slices: makeV4SliceWithEndpoints(corev1.ProtocolTCP,
+					kubetest.MakeTerminatingServingEndpoint(nodeA, "10.128.0.2"),
+					kubetest.MakeTerminatingNonServingEndpoint(nodeB, "10.128.1.2")),
+				service: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns},
+					Spec: corev1.ServiceSpec{
+						Type:                  corev1.ServiceTypeLoadBalancer,
+						ClusterIP:             "192.168.1.1",
+						ClusterIPs:            []string{"192.168.1.1"},
+						ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
+						Ports: []corev1.ServicePort{{
+							Name:       portName,
+							Port:       inport,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: outportstr,
+							NodePort:   5,
+						}},
+						ExternalIPs: []string{"4.2.2.2"},
+					},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{
+								IP: "5.5.5.5",
+							}},
+						},
+					},
+				},
+			},
+			resultsSame: true,
+			resultSharedGatewayCluster: []lbConfig{
+				{
+					vips:             []string{"192.168.1.1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           inport,
+					clusterEndpoints: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+					nodeEndpoints:    util.PortToLBEndpoints{nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})}},
+				},
+			},
+			resultSharedGatewayNode: []lbConfig{
+				{
+					vips:                 []string{"node"},
+					protocol:             corev1.ProtocolTCP,
+					inport:               5,
+					hasNodePort:          true,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+					nodeEndpoints:        util.PortToLBEndpoints{nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})}},
+				},
+				{
+					vips:                 []string{"4.2.2.2", "5.5.5.5"},
+					protocol:             corev1.ProtocolTCP,
+					inport:               inport,
+					hasNodePort:          false,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})},
+					nodeEndpoints:        util.PortToLBEndpoints{nodeA: util.LBEndpoints{newLBEndpointEntry(outport, []string{"10.128.0.2"}, []string{})}},
+				},
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(fmt.Sprintf("%d_%s", i, tt.name), func(t *testing.T) {
+			// shared gateway mode
+			globalconfig.Gateway.Mode = globalconfig.GatewayModeShared
+			perNode, template, clusterWide := buildServiceLBConfigs(tt.args.service, tt.args.slices, defaultNodes, true, true, &util.DefaultNetInfo{})
+
+			assert.Equal(t, tt.resultSharedGatewayNode, perNode, "SGW per-node configs should be equal")
+			assert.Equal(t, tt.resultSharedGatewayTemplate, template, "SGW template configs should be equal")
+			assert.Equal(t, tt.resultSharedGatewayCluster, clusterWide, "SGW cluster-wide configs should be equal")
+
+			// local gateway mode
+			globalconfig.Gateway.Mode = globalconfig.GatewayModeLocal
+
+			perNode, template, clusterWide = buildServiceLBConfigs(tt.args.service, tt.args.slices, defaultNodes, true, true, &util.DefaultNetInfo{})
+			if tt.resultsSame {
+				assert.Equal(t, tt.resultSharedGatewayNode, perNode, "LGW per-node configs should be equal")
+				assert.Equal(t, tt.resultSharedGatewayTemplate, template, "LGW template configs should be equal")
+				assert.Equal(t, tt.resultSharedGatewayCluster, clusterWide, "LGW cluster-wide configs should be equal")
+			} else {
+				assert.Equal(t, tt.resultLocalGatewayNode, perNode, "LGW per-node configs should be equal")
+				assert.Equal(t, tt.resultLocalGatewayTemplate, template, "LGW template configs should be equal")
+				assert.Equal(t, tt.resultLocalGatewayCluster, clusterWide, "LGW cluster-wide configs should be equal")
+			}
+		})
+	}
+}
+
+func Test_buildClusterLBs(t *testing.T) {
+	name := "foo"
+	namespace := "testns"
+
+	oldGwMode := globalconfig.Gateway.Mode
+	oldIPv4Mode := globalconfig.IPv4Mode
+	defer func() {
+		globalconfig.Gateway.Mode = oldGwMode
+		globalconfig.IPv4Mode = oldIPv4Mode
+	}()
+	globalconfig.Gateway.Mode = globalconfig.GatewayModeShared
+
+	defaultService := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP,
+		},
+	}
+
+	defaultRouters := []string{}
+	defaultSwitches := []string{}
+	defaultGroups := []string{types.ClusterLBGroupName}
+	defaultOpts := LBOpts{Reject: true}
+
+	globalconfig.IPv4Mode = true
+	l3UDN, err := getSampleUDNNetInfo(namespace, "layer3")
+	require.NoError(t, err)
+	l2UDN, err := getSampleUDNNetInfo(namespace, "layer2")
+	require.NoError(t, err)
+	udnNets := []util.NetInfo{l3UDN, l2UDN}
+
+	tc := []struct {
+		name      string
+		service   *corev1.Service
+		configs   []lbConfig
+		nodeInfos []nodeInfo
+		expected  []LB
+	}{
+		{
+			name:    "two tcp services, single stack",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:             []string{"1.2.3.4"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           80,
+					clusterEndpoints: util.LBEndpoints{{Port: 8080, V4IPs: []string{"192.168.0.1", "192.168.0.2"}}},
+					nodeEndpoints:    util.PortToLBEndpoints{nodeA: {{Port: 8080, V4IPs: []string{"192.168.0.1", "192.168.0.2"}}}},
+				},
+				{
+					vips:             []string{"1.2.3.4"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           443,
+					clusterEndpoints: util.LBEndpoints{{Port: 8043, V4IPs: []string{"192.168.0.1"}}},
+					nodeEndpoints:    util.PortToLBEndpoints{nodeA: {{Port: 8043, V4IPs: []string{"192.168.0.1"}}}},
+				},
+			},
+			nodeInfos: defaultNodes,
+			expected: []LB{
+				{
+					Name:        fmt.Sprintf("Service_%s/%s_TCP_cluster", namespace, name),
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "192.168.0.1", Port: 8080}, {IP: "192.168.0.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 443},
+							Targets: []Addr{{IP: "192.168.0.1", Port: 8043}},
+						},
+					},
+
+					Routers:  defaultRouters,
+					Switches: defaultSwitches,
+					Groups:   defaultGroups,
+					Opts:     defaultOpts,
+				},
+			},
+		},
+		{
+			name:    "tcp / udp services, single stack",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:             []string{"1.2.3.4"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           80,
+					clusterEndpoints: util.LBEndpoints{{Port: 8080, V4IPs: []string{"192.168.0.1", "192.168.0.2"}}},
+					nodeEndpoints:    util.PortToLBEndpoints{nodeA: {{Port: 8080, V4IPs: []string{"192.168.0.1", "192.168.0.2"}}}},
+				},
+				{
+					vips:             []string{"1.2.3.4"},
+					protocol:         corev1.ProtocolUDP,
+					inport:           443,
+					clusterEndpoints: util.LBEndpoints{{Port: 8043, V4IPs: []string{"192.168.0.1"}}},
+					nodeEndpoints:    util.PortToLBEndpoints{nodeA: {{Port: 8043, V4IPs: []string{"192.168.0.1"}}}},
+				},
+			},
+			nodeInfos: defaultNodes,
+			expected: []LB{
+				{
+					Name:        fmt.Sprintf("Service_%s/%s_TCP_cluster", namespace, name),
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "192.168.0.1", Port: 8080}, {IP: "192.168.0.2", Port: 8080}},
+						},
+					},
+
+					Switches: defaultSwitches,
+					Routers:  defaultRouters,
+					Groups:   defaultGroups,
+					Opts:     defaultOpts,
+				},
+				{
+					Name:        fmt.Sprintf("Service_%s/%s_UDP_cluster", namespace, name),
+					Protocol:    "UDP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 443},
+							Targets: []Addr{{IP: "192.168.0.1", Port: 8043}},
+						},
+					},
+
+					Switches: defaultSwitches,
+					Routers:  defaultRouters,
+					Groups:   defaultGroups,
+					Opts:     defaultOpts,
+				},
+			},
+		},
+		{
+			name:    "dual stack",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:     []string{"1.2.3.4", "fe80::1"},
+					protocol: corev1.ProtocolTCP,
+					inport:   80,
+					clusterEndpoints: util.LBEndpoints{{Port: 8080,
+						V4IPs: []string{"192.168.0.1", "192.168.0.2"},
+						V6IPs: []string{"fe90::1", "fe91::1"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080,
+							V4IPs: []string{"192.168.0.1", "192.168.0.2"},
+							V6IPs: []string{"fe90::1", "fe91::1"},
+						}},
+					},
+				},
+				{
+					vips:             []string{"1.2.3.4", "fe80::1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           443,
+					clusterEndpoints: util.LBEndpoints{{Port: 8043, V4IPs: []string{"192.168.0.1"}, V6IPs: []string{"fe90::1"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8043,
+							V4IPs: []string{"192.168.0.1"},
+							V6IPs: []string{"fe90::1"},
+						}},
+					},
+				},
+			},
+			nodeInfos: defaultNodes,
+			expected: []LB{
+				{
+					Name:        fmt.Sprintf("Service_%s/%s_TCP_cluster", namespace, name),
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "192.168.0.1", Port: 8080}, {IP: "192.168.0.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "fe80::1", Port: 80},
+							Targets: []Addr{{IP: "fe90::1", Port: 8080}, {IP: "fe91::1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 443},
+							Targets: []Addr{{IP: "192.168.0.1", Port: 8043}},
+						},
+						{
+							Source:  Addr{IP: "fe80::1", Port: 443},
+							Targets: []Addr{{IP: "fe90::1", Port: 8043}},
+						},
+					},
+
+					Routers:  defaultRouters,
+					Switches: defaultSwitches,
+					Groups:   defaultGroups,
+					Opts:     defaultOpts,
+				},
+			},
+		},
+	}
+	for i, tt := range tc {
+		t.Run(fmt.Sprintf("%d_%s", i, tt.name), func(t *testing.T) {
+
+			// default network
+			actual := buildClusterLBs(tt.service, tt.configs, tt.nodeInfos, true, &util.DefaultNetInfo{})
+			assert.Equal(t, tt.expected, actual)
+
+			// UDN
+			for _, udn := range udnNets {
+				UDNExternalIDs := loadBalancerExternalIDsForNetwork(namespacedServiceName(namespace, name), udn.GetNetworkName())
+				expected := make([]LB, len(tt.expected))
+				copy(expected, tt.expected)
+				for idx := range tt.expected {
+					expected[idx].ExternalIDs = UDNExternalIDs
+					expected[idx].Groups = []string{udn.GetNetworkScopedLoadBalancerGroupName(types.ClusterLBGroupName)}
+					expected[idx].Name = udn.GetNetworkScopedLoadBalancerName(tt.expected[idx].Name)
+				}
+				actual = buildClusterLBs(tt.service, tt.configs, tt.nodeInfos, true, udn)
+				assert.Equal(t, expected, actual)
+			}
+		})
+	}
+}
+
+func Test_buildPerNodeLBs(t *testing.T) {
+	oldClusterSubnet := globalconfig.Default.ClusterSubnets
+	oldGwMode := globalconfig.Gateway.Mode
+	oldServiceCIDRs := globalconfig.Kubernetes.ServiceCIDRs
+	oldIPv4Mode := globalconfig.IPv4Mode
+	defer func() {
+		globalconfig.IPv4Mode = oldIPv4Mode
+		globalconfig.Gateway.Mode = oldGwMode
+		globalconfig.Default.ClusterSubnets = oldClusterSubnet
+		globalconfig.Kubernetes.ServiceCIDRs = oldServiceCIDRs
+	}()
+
+	_, cidr4, _ := net.ParseCIDR("10.128.0.0/16")
+	_, cidr6, _ := net.ParseCIDR("fe00::/64")
+	globalconfig.Default.ClusterSubnets = []globalconfig.CIDRNetworkEntry{{CIDR: cidr4, HostSubnetLength: 26}, {CIDR: cidr6, HostSubnetLength: 26}}
+	_, svcCIDRv4, _ := net.ParseCIDR("192.168.0.0/24")
+	_, svcCIDRv6, _ := net.ParseCIDR("fd92::0/80")
+
+	globalconfig.Kubernetes.ServiceCIDRs = []*net.IPNet{svcCIDRv4}
+	globalconfig.IPv4Mode = true
+
+	name := "foo"
+	namespace := "testns"
+
+	l3UDN, err := getSampleUDNNetInfo(namespace, "layer3")
+	require.NoError(t, err)
+	l2UDN, err := getSampleUDNNetInfo(namespace, "layer2")
+	require.NoError(t, err)
+	udnNetworks := []util.NetInfo{l3UDN, l2UDN}
+
+	defaultService := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP,
+		},
+	}
+
+	defaultNodes := []nodeInfo{
+		{
+			name:               nodeA,
+			l3gatewayAddresses: []net.IP{net.ParseIP("10.0.0.1")},
+			hostAddresses:      []net.IP{net.ParseIP("10.0.0.1"), net.ParseIP("10.0.0.111")},
+			gatewayRouterName:  "gr-node-a",
+			switchName:         "switch-node-a",
+			podSubnets:         []net.IPNet{{IP: net.ParseIP("10.128.0.0"), Mask: net.CIDRMask(24, 32)}},
+		},
+		{
+			name:               nodeB,
+			l3gatewayAddresses: []net.IP{net.ParseIP("10.0.0.2")},
+			hostAddresses:      []net.IP{net.ParseIP("10.0.0.2")},
+			gatewayRouterName:  "gr-node-b",
+			switchName:         "switch-node-b",
+			podSubnets:         []net.IPNet{{IP: net.ParseIP("10.128.1.0"), Mask: net.CIDRMask(24, 32)}},
+		},
+	}
+
+	defaultNodesV6 := []nodeInfo{
+		{
+			name:               nodeA,
+			l3gatewayAddresses: []net.IP{net.ParseIP("fd00::1")},
+			hostAddresses:      []net.IP{net.ParseIP("fd00::1"), net.ParseIP("fd00::111")},
+			gatewayRouterName:  "gr-node-a",
+			switchName:         "switch-node-a",
+			podSubnets:         []net.IPNet{{IP: net.ParseIP("fe00:0:0:0:1::0"), Mask: net.CIDRMask(64, 64)}},
+		},
+		{
+			name:               nodeB,
+			l3gatewayAddresses: []net.IP{net.ParseIP("fd00::2")},
+			hostAddresses:      []net.IP{net.ParseIP("fd00::2")},
+			gatewayRouterName:  "gr-node-b",
+			switchName:         "switch-node-b",
+			podSubnets:         []net.IPNet{{IP: net.ParseIP("fe00:0:0:0:2::0"), Mask: net.CIDRMask(64, 64)}},
+		},
+	}
+
+	defaultOpts := LBOpts{Reject: true}
+
+	//defaultRouters := []string{"gr-node-a", "gr-node-b"}
+	//defaultSwitches := []string{"switch-node-a", "switch-node-b"}
+
+	tc := []struct {
+		name           string
+		service        *corev1.Service
+		configs        []lbConfig
+		expectedShared []LB
+		expectedLocal  []LB
+	}{
+		{
+			name:    "host-network pod",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:             []string{"1.2.3.4"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           80,
+					clusterEndpoints: util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.0.0.1"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080,
+							V4IPs: []string{"10.0.0.1"},
+						}},
+					},
+				},
+			},
+			expectedShared: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a_merged",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Switches:    []string{"switch-node-a", "switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+		},
+		{
+			name:    "nodeport service, standard pod",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:             []string{"node"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           80,
+					clusterEndpoints: util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.128.0.2"}}},
+					nodeEndpoints:    util.PortToLBEndpoints{nodeA: {{Port: 8080, V4IPs: []string{"10.128.0.2"}}}},
+				},
+			},
+			expectedShared: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router+switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_router+switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+			expectedLocal: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router+switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_router+switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+		},
+		{
+			name:    "nodeport service, host-network pod",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:             []string{"192.168.0.1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           80,
+					clusterEndpoints: util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.0.0.1"}}},
+					nodeEndpoints:    util.PortToLBEndpoints{nodeA: {{Port: 8080, V4IPs: []string{"10.0.0.1"}}}},
+				},
+				{
+					vips:             []string{"node"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           80,
+					clusterEndpoints: util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.0.0.1"}}},
+					nodeEndpoints:    util.PortToLBEndpoints{nodeA: {{Port: 8080, V4IPs: []string{"10.0.0.1"}}}},
+				},
+			},
+			expectedShared: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_router+switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+			expectedLocal: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_router+switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+		},
+		{
+			// The most complicated case
+			name:    "nodeport service, host-network pod, ExternalTrafficPolicy=local",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:             []string{"192.168.0.1"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           80,
+					clusterEndpoints: util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.0.0.1"}}},
+					nodeEndpoints:    util.PortToLBEndpoints{nodeA: {{Port: 8080, V4IPs: []string{"10.0.0.1"}}}},
+				},
+				{
+					vips:                 []string{"node"},
+					protocol:             corev1.ProtocolTCP,
+					inport:               80,
+					externalTrafficLocal: true,
+					hasNodePort:          true,
+					clusterEndpoints:     util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.0.0.1"}}},
+					nodeEndpoints:        util.PortToLBEndpoints{nodeA: {{Port: 8080, V4IPs: []string{"10.0.0.1"}}}},
+				},
+			},
+			expectedShared: []LB{
+				// node-a has endpoints: 3 load balancers
+				// router clusterip
+				// router nodeport
+				// switch clusterip + nodeport
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_local_router_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Opts:        LBOpts{SkipSNAT: true, Reject: true},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+					},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+
+				// node-b has no endpoint, 3 lbs
+				// router clusterip
+				// router nodeport = empty
+				// switch clusterip + nodeport
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 80},
+							Targets: []Addr{},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 80},
+							Targets: []Addr{},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+		},
+		{
+			name:    "clusterIP + externalIP service, standard pods, InternalTrafficPolicy=local",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:                 []string{"192.168.0.1"}, // clusterIP config
+					protocol:             corev1.ProtocolTCP,
+					inport:               80,
+					internalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.128.0.1", "10.128.1.1"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080, V4IPs: []string{"10.128.0.1"}}},
+						nodeB: {{Port: 8080, V4IPs: []string{"10.128.1.1"}}},
+					},
+				},
+				{
+					vips:             []string{"1.2.3.4"}, // externalIP config
+					protocol:         corev1.ProtocolTCP,
+					inport:           80,
+					clusterEndpoints: util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.128.0.1", "10.128.1.1"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080, V4IPs: []string{"10.128.0.1"}}},
+						nodeB: {{Port: 8080, V4IPs: []string{"10.128.1.1"}}},
+					},
+				},
+			},
+			expectedShared: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-a_merged",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a", "gr-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.1", Port: 8080}, {IP: "10.128.1.1", Port: 8080}}, // no filtering on GR LBs for ITP=local
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.1", Port: 8080}, {IP: "10.128.1.1", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.1", Port: 8080}}, // filters out the ep present only on node-a
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.1", Port: 8080}, {IP: "10.128.1.1", Port: 8080}}, // ITP is only applicable for clusterIPs
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.128.1.1", Port: 8080}}, // filters out the ep present only on node-b
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.1", Port: 8080}, {IP: "10.128.1.1", Port: 8080}}, // ITP is only applicable for clusterIPs
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+			expectedLocal: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-a_merged",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a", "gr-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.1", Port: 8080}, {IP: "10.128.1.1", Port: 8080}}, // no filtering on GR LBs for ITP=local
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.1", Port: 8080}, {IP: "10.128.1.1", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.1", Port: 8080}}, // filters out the ep present only on node-a
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.1", Port: 8080}, {IP: "10.128.1.1", Port: 8080}}, // ITP is only applicable for clusterIPs
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.128.1.1", Port: 8080}}, // filters out the ep present only on node-b
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.1", Port: 8080}, {IP: "10.128.1.1", Port: 8080}}, // ITP is only applicable for clusterIPs
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+		},
+		{
+			name:    "clusterIP + externalIP service, host-networked pods, InternalTrafficPolicy=local",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:                 []string{"192.168.0.1"}, // clusterIP config
+					protocol:             corev1.ProtocolTCP,
+					inport:               80,
+					internalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.0.0.1", "10.0.0.2"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080, V4IPs: []string{"10.0.0.1"}}},
+						nodeB: {{Port: 8080, V4IPs: []string{"10.0.0.2"}}},
+					},
+				},
+				{
+					vips:             []string{"1.2.3.4"}, // externalIP config
+					protocol:         corev1.ProtocolTCP,
+					inport:           80,
+					clusterEndpoints: util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.0.0.1", "10.0.0.2"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080, V4IPs: []string{"10.0.0.1"}}},
+						nodeB: {{Port: 8080, V4IPs: []string{"10.0.0.2"}}},
+					},
+				},
+			},
+			expectedShared: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}, {IP: "10.0.0.2", Port: 8080}}, // no filtering on GR LBs for ITP=local
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}, {IP: "10.0.0.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}}, // filters out the ep present only on node-a
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}, {IP: "10.0.0.2", Port: 8080}}, // ITP is only applicable for clusterIPs
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}, {IP: "169.254.169.2", Port: 8080}}, // no filtering on GR LBs for ITP=local
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}, {IP: "169.254.169.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.2", Port: 8080}}, // filters out the ep present only on node-b
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}, {IP: "10.0.0.2", Port: 8080}}, // ITP is only applicable for clusterIPs
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+			expectedLocal: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}, {IP: "10.0.0.2", Port: 8080}}, // no filtering on GR LBs for ITP=local
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}, {IP: "10.0.0.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}}, // filters out the ep present only on node-a
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}, {IP: "10.0.0.2", Port: 8080}}, // ITP is only applicable for clusterIPs
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}, {IP: "169.254.169.2", Port: 8080}}, // no filtering on GR LBs for ITP=local
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}, {IP: "169.254.169.2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.2", Port: 8080}}, // filters out the ep present only on node-b
+						},
+						{
+							Source:  Addr{IP: "1.2.3.4", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}, {IP: "10.0.0.2", Port: 8080}}, // ITP is only applicable for clusterIPs
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+		},
+		{
+			// Another complicated case
+			name:    "clusterIP + nodeport service, host-network pod, ExternalTrafficPolicy=local, InternalTrafficPolicy=local",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:                 []string{"192.168.0.1"}, // clusterIP config
+					protocol:             corev1.ProtocolTCP,
+					inport:               80,
+					internalTrafficLocal: true,
+					externalTrafficLocal: false, // ETP is applicable only to nodePorts and LBs
+					clusterEndpoints:     util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.0.0.1"}}},
+					nodeEndpoints:        util.PortToLBEndpoints{nodeA: {{Port: 8080, V4IPs: []string{"10.0.0.1"}}}},
+				},
+				{
+					vips:                 []string{"node"}, // nodePort config
+					protocol:             corev1.ProtocolTCP,
+					inport:               34345,
+					externalTrafficLocal: true,
+					internalTrafficLocal: false, // ITP is applicable only to clusterIPs
+					hasNodePort:          true,
+					clusterEndpoints:     util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.0.0.1"}}},
+					nodeEndpoints:        util.PortToLBEndpoints{nodeA: {{Port: 8080, V4IPs: []string{"10.0.0.1"}}}},
+				},
+			},
+			expectedShared: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}}, // we don't filter clusterIPs at GR for ETP/ITP=local
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_local_router_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Opts:        LBOpts{SkipSNAT: true, Reject: true},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 34345},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}}, // special skip_snat=true LB for ETP=local; used in SGW mode
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 34345},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+					},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}}, // filter out eps only on node-a for clusterIP
+						},
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 34345}, // add special masqueradeIP VIP for nodePort/LB traffic coming from node via mp0 when ETP=local
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},   // filter out eps only on node-a for nodePorts
+						},
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 34345},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 34345},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 34345},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}}, // don't filter out eps for nodePorts on switches when ETP=local
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}}, // we don't filter clusterIPs at GR for ETP/ITP=local
+						},
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 34345},
+							Targets: []Addr{}, // filter out eps only on node-b for nodePort on GR when ETP=local
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{}, // filter out eps only on node-b for clusterIP
+						},
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 34345}, // add special masqueradeIP VIP for nodePort/LB traffic coming from node via mp0 when ETP=local
+							Targets: []Addr{},                               // filter out eps only on node-b for nodePorts
+						},
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 34345},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}}, // don't filter out eps for nodePorts on switches when ETP=local
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+			expectedLocal: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}}, // we don't filter clusterIPs at GR for ETP/ITP=local
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_local_router_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Opts:        LBOpts{SkipSNAT: true, Reject: true},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 34345},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}}, // special skip_snat=true LB for ETP=local; used in SGW mode
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 34345},
+							Targets: []Addr{{IP: "169.254.169.2", Port: 8080}},
+						},
+					},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}}, // filter out eps only on node-a for clusterIP
+						},
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 34345}, // add special masqueradeIP VIP for nodePort/LB traffic coming from node via mp0 when ETP=local
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},   // filter out eps only on node-a for nodePorts
+						},
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 34345},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 34345},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 34345},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}}, // don't filter out eps for nodePorts on switches when ETP=local
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_router_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}}, // we don't filter clusterIPs at GR for ETP/ITP=local
+						},
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 34345},
+							Targets: []Addr{}, // filter out eps only on node-b for nodePort on GR when ETP=local
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "192.168.0.1", Port: 80},
+							Targets: []Addr{}, // filter out eps only on node-b for clusterIP
+						},
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 34345}, // add special masqueradeIP VIP for nodePort/LB traffic coming from node via mp0 when ETP=local
+							Targets: []Addr{},                               // filter out eps only on node-b for nodePorts
+						},
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 34345},
+							Targets: []Addr{{IP: "10.0.0.1", Port: 8080}}, // don't filter out eps for nodePorts on switches when ETP=local
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+		},
+		// tests for endpoint selection with ExternalTrafficPolicy=local
+		{
+			name:    "LB service with NodePort, standard pods on different nodes, ExternalTrafficPolicy=local, both endpoints are ready",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:                 []string{"node"},
+					protocol:             corev1.ProtocolTCP,
+					inport:               5, // nodePort
+					hasNodePort:          true,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.128.0.2", "10.128.1.2"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080, V4IPs: []string{"10.128.0.2"}}},
+						nodeB: {{Port: 8080, V4IPs: []string{"10.128.1.2"}}},
+					},
+				},
+				{
+					vips:                 []string{"4.2.2.2", "5.5.5.5"}, // externalIP + LB IP
+					protocol:             corev1.ProtocolTCP,
+					inport:               80,
+					hasNodePort:          false,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.128.0.2", "10.128.1.2"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080, V4IPs: []string{"10.128.0.2"}}},
+						nodeB: {{Port: 8080, V4IPs: []string{"10.128.1.2"}}},
+					},
+				},
+			},
+			expectedShared: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_local_router_node-a",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        LBOpts{SkipSNAT: true, Reject: true},
+
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // local endpoint (ready)
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // local endpoint (ready)
+						},
+						{
+							Source:  Addr{IP: "4.2.2.2", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // local endpoint (ready)
+						},
+						{
+							Source:  Addr{IP: "5.5.5.5", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // local endpoint (ready)
+						},
+					},
+					Routers: []string{"gr-node-a"},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        defaultOpts,
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}, {IP: "10.128.1.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}, {IP: "10.128.1.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "4.2.2.2", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}, {IP: "10.128.1.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "5.5.5.5", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}, {IP: "10.128.1.2", Port: 8080}},
+						},
+					},
+					Switches: []string{"switch-node-a"},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_local_router_node-b",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        LBOpts{SkipSNAT: true, Reject: true},
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 5},
+							Targets: []Addr{{IP: "10.128.1.2", Port: 8080}}, // local endpoint (ready)
+						},
+						{
+							Source:  Addr{IP: "4.2.2.2", Port: 80},
+							Targets: []Addr{{IP: "10.128.1.2", Port: 8080}}, // local endpoint (ready)
+						},
+						{
+							Source:  Addr{IP: "5.5.5.5", Port: 80},
+							Targets: []Addr{{IP: "10.128.1.2", Port: 8080}}, // local endpoint (ready)
+						},
+					},
+					Routers: []string{"gr-node-b"},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-b",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        defaultOpts,
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 5},
+							Targets: []Addr{{IP: "10.128.1.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}, {IP: "10.128.1.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "4.2.2.2", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}, {IP: "10.128.1.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "5.5.5.5", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}, {IP: "10.128.1.2", Port: 8080}},
+						},
+					},
+					Switches: []string{"switch-node-b"},
+				},
+			},
+		},
+		{
+			name:    "LB service with NodePort, standard pods on different nodes, ExternalTrafficPolicy=local, one endpoint is ready, the other one is terminating and serving",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:                 []string{"node"},
+					protocol:             corev1.ProtocolTCP,
+					inport:               5, // nodePort
+					hasNodePort:          true,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.128.0.2"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080, V4IPs: []string{"10.128.0.2"}}},
+						nodeB: {{Port: 8080, V4IPs: []string{"10.128.1.2"}}},
+					},
+				},
+				{
+					vips:                 []string{"4.2.2.2", "5.5.5.5"}, // externalIP + LB IP
+					protocol:             corev1.ProtocolTCP,
+					inport:               80,
+					hasNodePort:          false,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{{Port: 8080, V4IPs: []string{"10.128.0.2"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080, V4IPs: []string{"10.128.0.2"}}},
+						nodeB: {{Port: 8080, V4IPs: []string{"10.128.1.2"}}},
+					},
+				},
+			},
+			expectedShared: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_local_router_node-a",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        LBOpts{SkipSNAT: true, Reject: true},
+
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // local endpoint
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // local endpoint
+						},
+						{
+							Source:  Addr{IP: "4.2.2.2", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // local endpoint
+						},
+						{
+							Source:  Addr{IP: "5.5.5.5", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // local endpoint
+						},
+					},
+					Routers: []string{"gr-node-a"},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        defaultOpts,
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.1", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.111", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+						{
+							Source:  Addr{IP: "4.2.2.2", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+						{
+							Source:  Addr{IP: "5.5.5.5", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+					},
+					Switches: []string{"switch-node-a"},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_local_router_node-b",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        LBOpts{SkipSNAT: true, Reject: true},
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 5},
+							Targets: []Addr{{IP: "10.128.1.2", Port: 8080}}, // local endpoint (fallback to terminating and serving)
+						},
+						{
+							Source:  Addr{IP: "4.2.2.2", Port: 80},
+							Targets: []Addr{{IP: "10.128.1.2", Port: 8080}}, // local endpoint (fallback to terminating and serving)
+						},
+						{
+							Source:  Addr{IP: "5.5.5.5", Port: 80},
+							Targets: []Addr{{IP: "10.128.1.2", Port: 8080}}, // local endpoint (fallback to terminating and serving)
+						},
+					},
+					Routers: []string{"gr-node-b"},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-b",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        defaultOpts,
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "169.254.169.3", Port: 5},
+							Targets: []Addr{{IP: "10.128.1.2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "10.0.0.2", Port: 5},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+						{
+							Source:  Addr{IP: "4.2.2.2", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+						{
+							Source:  Addr{IP: "5.5.5.5", Port: 80},
+							Targets: []Addr{{IP: "10.128.0.2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+					},
+					Switches: []string{"switch-node-b"},
+				},
+			},
+		},
+	}
+
+	// needs separate configuration variables for a V6 cluster
+	tcV6 := []struct {
+		name           string
+		service        *corev1.Service
+		configs        []lbConfig
+		expectedShared []LB
+		expectedLocal  []LB
+	}{
+		// exactly the same as the v4 test under the same name
+		{
+			name:    "ipv6, nodeport service, standard pod",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:             []string{"node"},
+					protocol:         corev1.ProtocolTCP,
+					inport:           80,
+					clusterEndpoints: util.LBEndpoints{{Port: 8080, V6IPs: []string{"fe00:0:0:0:1::2"}}},
+					nodeEndpoints:    util.PortToLBEndpoints{nodeA: {{Port: 8080, V6IPs: []string{"fe00:0:0:0:1::2"}}}},
+				},
+			},
+			expectedShared: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router+switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "fd00::1", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "fd00::111", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_router+switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "fd00::2", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+			expectedLocal: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_router+switch_node-a",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-a"},
+					Switches:    []string{"switch-node-a"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "fd00::1", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "fd00::111", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_router+switch_node-b",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Routers:     []string{"gr-node-b"},
+					Switches:    []string{"switch-node-b"},
+					Protocol:    "TCP",
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "fd00::2", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}},
+						},
+					},
+					Opts: defaultOpts,
+				},
+			},
+		},
+		{
+			// exactly the same as last test case for IPv4 but IPv6
+			name:    "IPv6, LB service with NodePort, standard pods on different nodes, ExternalTrafficPolicy=local, one endpoint is ready, the other one is terminating and serving",
+			service: defaultService,
+			configs: []lbConfig{
+				{
+					vips:                 []string{"node"},
+					protocol:             corev1.ProtocolTCP,
+					inport:               5, // nodePort
+					hasNodePort:          true,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{{Port: 8080, V6IPs: []string{"fe00:0:0:0:1::2"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080, V6IPs: []string{"fe00:0:0:0:1::2"}}},
+						nodeB: {{Port: 8080, V6IPs: []string{"fe00:0:0:0:2::2"}}},
+					},
+				},
+				{
+					vips:                 []string{"cafe::2", "abcd::5"}, // externalIP + LB IP
+					protocol:             corev1.ProtocolTCP,
+					inport:               80,
+					hasNodePort:          false,
+					externalTrafficLocal: true,
+					clusterEndpoints:     util.LBEndpoints{{Port: 8080, V6IPs: []string{"fe00:0:0:0:1::2"}}},
+					nodeEndpoints: util.PortToLBEndpoints{
+						nodeA: {{Port: 8080, V6IPs: []string{"fe00:0:0:0:1::2"}}},
+						nodeB: {{Port: 8080, V6IPs: []string{"fe00:0:0:0:2::2"}}},
+					},
+				},
+			},
+			expectedShared: []LB{
+				{
+					Name:        "Service_testns/foo_TCP_node_local_router_node-a",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        LBOpts{SkipSNAT: true, Reject: true},
+
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "fd00::1", Port: 5},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}}, // local endpoint
+						},
+						{
+							Source:  Addr{IP: "fd00::111", Port: 5},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}}, // local endpoint
+						},
+						{
+							Source:  Addr{IP: "cafe::2", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}}, // local endpoint
+						},
+						{
+							Source:  Addr{IP: "abcd::5", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}}, // local endpoint
+						},
+					},
+					Routers: []string{"gr-node-a"},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-a",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        defaultOpts,
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "fd69::3", Port: 5},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "fd00::1", Port: 5},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+						{
+							Source:  Addr{IP: "fd69::3", Port: 5},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "fd00::111", Port: 5},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+						{
+							Source:  Addr{IP: "cafe::2", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+						{
+							Source:  Addr{IP: "abcd::5", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+					},
+					Switches: []string{"switch-node-a"},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_local_router_node-b",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        LBOpts{SkipSNAT: true, Reject: true},
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "fd00::2", Port: 5},
+							Targets: []Addr{{IP: "fe00:0:0:0:2::2", Port: 8080}}, // local endpoint (fallback to terminating and serving)
+						},
+						{
+							Source:  Addr{IP: "cafe::2", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:2::2", Port: 8080}}, // local endpoint (fallback to terminating and serving)
+						},
+						{
+							Source:  Addr{IP: "abcd::5", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:2::2", Port: 8080}}, // local endpoint (fallback to terminating and serving)
+						},
+					},
+					Routers: []string{"gr-node-b"},
+				},
+				{
+					Name:        "Service_testns/foo_TCP_node_switch_node-b",
+					Protocol:    "TCP",
+					ExternalIDs: loadBalancerExternalIDs(namespacedServiceName(namespace, name)),
+					Opts:        defaultOpts,
+					Rules: []LBRule{
+						{
+							Source:  Addr{IP: "fd69::3", Port: 5},
+							Targets: []Addr{{IP: "fe00:0:0:0:2::2", Port: 8080}},
+						},
+						{
+							Source:  Addr{IP: "fd00::2", Port: 5},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+						{
+							Source:  Addr{IP: "cafe::2", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+						{
+							Source:  Addr{IP: "abcd::5", Port: 80},
+							Targets: []Addr{{IP: "fe00:0:0:0:1::2", Port: 8080}}, // prefer endpoint on node1 since it's ready
+						},
+					},
+					Switches: []string{"switch-node-b"},
+				},
+			},
+		},
+	}
+
+	// v4
+	for i, tt := range tc {
+		t.Run(fmt.Sprintf("%d_%s", i, tt.name), func(t *testing.T) {
+			if tt.expectedShared != nil {
+				globalconfig.Gateway.Mode = globalconfig.GatewayModeShared
+				// cluster default network
+				actual := buildPerNodeLBs(tt.service, tt.configs, defaultNodes, &util.DefaultNetInfo{})
+				assert.Equal(t, tt.expectedShared, actual, "shared gateway mode not as expected")
+
+				// UDN
+				for _, udn := range udnNetworks {
+					expectedShared := make([]LB, len(tt.expectedShared))
+					copy(expectedShared, tt.expectedShared)
+					for idx := range tt.expectedShared {
+						expectedShared[idx].ExternalIDs = loadBalancerExternalIDsForNetwork(namespacedServiceName(namespace, name), udn.GetNetworkName())
+						expectedShared[idx].Name = udn.GetNetworkScopedLoadBalancerName(tt.expectedShared[idx].Name)
+					}
+					actual = buildPerNodeLBs(tt.service, tt.configs, defaultNodes, udn)
+					assert.Equal(t, expectedShared, actual, "shared gateway mode not as expected")
+				}
+			}
+
+			if tt.expectedLocal != nil {
+				globalconfig.Gateway.Mode = globalconfig.GatewayModeLocal
+
+				// cluster default network
+				actual := buildPerNodeLBs(tt.service, tt.configs, defaultNodes, &util.DefaultNetInfo{})
+				assert.Equal(t, tt.expectedLocal, actual, "local gateway mode not as expected")
+
+				// UDN
+				for _, udn := range udnNetworks {
+					expectedLocal := make([]LB, len(tt.expectedLocal))
+					copy(expectedLocal, tt.expectedLocal)
+					for idx := range tt.expectedLocal {
+						expectedLocal[idx].ExternalIDs = loadBalancerExternalIDsForNetwork(namespacedServiceName(namespace, name), udn.GetNetworkName())
+						expectedLocal[idx].Name = udn.GetNetworkScopedLoadBalancerName(tt.expectedLocal[idx].Name)
+					}
+					actual = buildPerNodeLBs(tt.service, tt.configs, defaultNodes, udn)
+					assert.Equal(t, expectedLocal, actual, "local gateway mode not as expected")
+				}
+			}
+
+		})
+	}
+
+	// v6
+	globalconfig.Kubernetes.ServiceCIDRs = []*net.IPNet{svcCIDRv6}
+	for i, tt := range tcV6 {
+		t.Run(fmt.Sprintf("%d_%s", i, tt.name), func(t *testing.T) {
+
+			if tt.expectedShared != nil {
+				globalconfig.Gateway.Mode = globalconfig.GatewayModeShared
+
+				// cluster default network
+				actual := buildPerNodeLBs(tt.service, tt.configs, defaultNodesV6, &util.DefaultNetInfo{})
+				assert.Equal(t, tt.expectedShared, actual, "shared gateway mode not as expected")
+
+				// UDN
+				for _, udn := range udnNetworks {
+					expectedShared := make([]LB, len(tt.expectedShared))
+					copy(expectedShared, tt.expectedShared)
+					for idx := range tt.expectedShared {
+						expectedShared[idx].ExternalIDs = loadBalancerExternalIDsForNetwork(namespacedServiceName(namespace, name), udn.GetNetworkName())
+						expectedShared[idx].Name = udn.GetNetworkScopedLoadBalancerName(tt.expectedShared[idx].Name)
+					}
+					actual = buildPerNodeLBs(tt.service, tt.configs, defaultNodesV6, udn)
+					assert.Equal(t, expectedShared, actual, "shared gateway mode not as expected for UDN")
+				}
+			}
+
+			if tt.expectedLocal != nil {
+				globalconfig.Gateway.Mode = globalconfig.GatewayModeLocal
+
+				// cluster default network
+				actual := buildPerNodeLBs(tt.service, tt.configs, defaultNodesV6, &util.DefaultNetInfo{})
+				assert.Equal(t, tt.expectedLocal, actual, "local gateway mode not as expected")
+
+				// UDN
+				for _, udn := range udnNetworks {
+					expectedLocal := make([]LB, len(tt.expectedLocal))
+					copy(expectedLocal, tt.expectedLocal)
+					for idx := range tt.expectedLocal {
+						expectedLocal[idx].ExternalIDs = loadBalancerExternalIDsForNetwork(namespacedServiceName(namespace, name), udn.GetNetworkName())
+						expectedLocal[idx].Name = udn.GetNetworkScopedLoadBalancerName(tt.expectedLocal[idx].Name)
+					}
+					actual = buildPerNodeLBs(tt.service, tt.configs, defaultNodesV6, udn)
+					assert.Equal(t, expectedLocal, actual, "local gateway mode not as expected for UDN")
+				}
+			}
+
+		})
+	}
+
+}
+
+// Test_buildTemplateLBs_multipleTargetPorts verifies that when multiple target
+// ports coexist (e.g. during a rolling update), buildTemplateLBs produces
+// template values that include targets for ALL port numbers, not just the last
+// one processed.
+func Test_buildTemplateLBs_multipleTargetPorts(t *testing.T) {
+	oldGwMode := globalconfig.Gateway.Mode
+	oldClusterSubnet := globalconfig.Default.ClusterSubnets
+	oldIPv4Mode := globalconfig.IPv4Mode
+	defer func() {
+		globalconfig.Gateway.Mode = oldGwMode
+		globalconfig.Default.ClusterSubnets = oldClusterSubnet
+		globalconfig.IPv4Mode = oldIPv4Mode
+	}()
+
+	_, cidr4, _ := net.ParseCIDR("10.128.0.0/16")
+	globalconfig.Default.ClusterSubnets = []globalconfig.CIDRNetworkEntry{{CIDR: cidr4, HostSubnetLength: 26}}
+	globalconfig.Gateway.Mode = globalconfig.GatewayModeShared
+	globalconfig.IPv4Mode = true
+
+	name := "foo"
+	namespace := "testns"
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeNodePort,
+		},
+	}
+
+	// Two nodes are needed so that ETP=local creates per-node differences,
+	// which forces the template path (needsTemplate=true).
+	nodes := []nodeInfo{
+		{
+			name:               nodeA,
+			l3gatewayAddresses: []net.IP{net.ParseIP("10.0.0.1")},
+			hostAddresses:      []net.IP{net.ParseIP("10.0.0.1")},
+			chassisID:          "chassis-a",
+			gatewayRouterName:  "gr-node-a",
+			switchName:         "switch-node-a",
+			podSubnets:         []net.IPNet{{IP: net.ParseIP("10.128.0.0"), Mask: net.CIDRMask(24, 32)}},
+		},
+		{
+			name:               nodeB,
+			l3gatewayAddresses: []net.IP{net.ParseIP("10.0.0.2")},
+			hostAddresses:      []net.IP{net.ParseIP("10.0.0.2")},
+			chassisID:          "chassis-b",
+			gatewayRouterName:  "gr-node-b",
+			switchName:         "switch-node-b",
+			podSubnets:         []net.IPNet{{IP: net.ParseIP("10.128.1.0"), Mask: net.CIDRMask(24, 32)}},
+		},
+	}
+
+	nodeIPv4Templates := NewNodeIPsTemplates(corev1.IPv4Protocol)
+	nodeIPv4Templates.AddIP("chassis-a", net.ParseIP("10.0.0.1"))
+	nodeIPv4Templates.AddIP("chassis-b", net.ParseIP("10.0.0.2"))
+	nodeIPv6Templates := NewNodeIPsTemplates(corev1.IPv6Protocol)
+
+	// Simulate a rolling update with ETP=local: port 8080 endpoints are on
+	// nodeA, port 9090 endpoints are on nodeB. This creates per-node
+	// differences that force the template code path.
+	configs := []lbConfig{
+		{
+			vips:     []string{placeholderNodeIPs},
+			protocol: corev1.ProtocolTCP,
+			inport:   80,
+			clusterEndpoints: util.LBEndpoints{
+				{Port: 8080, V4IPs: []string{"192.168.0.1"}},
+				{Port: 9090, V4IPs: []string{"192.168.0.2"}},
+			},
+			nodeEndpoints: util.PortToLBEndpoints{
+				nodeA: {
+					{Port: 8080, V4IPs: []string{"192.168.0.1"}},
+				},
+				nodeB: {
+					{Port: 9090, V4IPs: []string{"192.168.0.2"}},
+				},
+			},
+			externalTrafficLocal: true,
+			hasNodePort:          true,
+		},
+	}
+
+	result := buildTemplateLBs(service, configs, nodes, nodeIPv4Templates, nodeIPv6Templates, &util.DefaultNetInfo{})
+	require.NotEmpty(t, result, "expected at least one template LB")
+
+	// For each LB, collect all target ports from all rules. With templates,
+	// the per-chassis values are strings like "192.168.0.1:8080,192.168.0.2:9090".
+	// Before the fix, the template value would only contain one port's
+	// targets because the second portno iteration overwrote the first.
+	for _, lb := range result {
+		allTargetPorts := sets.New[int32]()
+		for _, rule := range lb.Rules {
+			for _, tgt := range rule.Targets {
+				if tgt.Template != nil {
+					for _, value := range tgt.Template.Value {
+						for _, addr := range strings.Split(value, ",") {
+							if addr == "" {
+								continue
+							}
+							parts := strings.Split(addr, ":")
+							if len(parts) == 2 {
+								port, err := strconv.Atoi(parts[1])
+								if err == nil {
+									allTargetPorts.Insert(int32(port))
+								}
+							}
+						}
+					}
+				} else if tgt.Port != 0 {
+					allTargetPorts.Insert(tgt.Port)
+				}
+			}
+		}
+		assert.True(t, allTargetPorts.Has(8080),
+			"LB %q should have targets with port 8080, got ports: %v", lb.Name, allTargetPorts.UnsortedList())
+		assert.True(t, allTargetPorts.Has(9090),
+			"LB %q should have targets with port 9090, got ports: %v", lb.Name, allTargetPorts.UnsortedList())
+	}
+}
+
+func Test_idledServices(t *testing.T) {
+	serviceName := "foo"
+	ns := "testns"
+	tenSecondsAgo := time.Now().Add(-10 * time.Second).Format(time.RFC3339)
+	oneHourAgo := time.Now().Add(-1 * time.Hour).Format(time.RFC3339)
+
+	globalconfig.Kubernetes.OVNEmptyLbEvents = true
+	defer func() {
+		globalconfig.Kubernetes.OVNEmptyLbEvents = false
+	}()
+
+	tc := []struct {
+		name     string
+		service  *corev1.Service
+		expected LBOpts
+	}{
+		{
+			name: "active service",
+			service: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns, Annotations: map[string]string{}},
+			},
+			expected: LBOpts{
+				Reject:        true,
+				EmptyLBEvents: false,
+			},
+		},
+		{
+			name: "idled service",
+			service: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns, Annotations: map[string]string{
+					"k8s.ovn.org/idled-at": "2023-01-01T13:14:15Z",
+				}},
+			},
+			expected: LBOpts{
+				Reject:        false,
+				EmptyLBEvents: true,
+			},
+		},
+		{
+			name: "recently unidled service",
+			service: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns, Annotations: map[string]string{
+					"k8s.ovn.org/unidled-at": tenSecondsAgo,
+				}},
+			},
+			expected: LBOpts{
+				Reject:        false,
+				EmptyLBEvents: true,
+			},
+		},
+		{
+			name: "long time unidled service",
+			service: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns, Annotations: map[string]string{
+					"k8s.ovn.org/unidled-at": oneHourAgo,
+				}},
+			},
+			expected: LBOpts{
+				Reject:        true,
+				EmptyLBEvents: false,
+			},
+		},
+	}
+
+	for i, tt := range tc {
+		t.Run(fmt.Sprintf("%d_%s", i, tt.name), func(t *testing.T) {
+			actualLbOpts := lbOpts(tt.service)
+			assert.Equal(t, tt.expected, actualLbOpts)
+		})
+	}
+}
+
+func Test_getEndpointsForService(t *testing.T) {
+	type args struct {
+		slices []*discovery.EndpointSlice
+		svc    *corev1.Service
+		nodes  sets.Set[string]
+	}
+
+	tests := []struct {
+		name                 string
+		args                 args
+		wantClusterEndpoints util.PortToLBEndpoints
+		wantNodeEndpoints    util.PortToNodeToLBEndpoints
+	}{
+		{
+			name: "empty slices",
+			args: args{
+				slices: []*discovery.EndpointSlice{},
+				svc:    getSampleServiceWithOnePort(httpPortName, httpPortValue, tcp),
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{},       // no cluster-wide endpoints
+			wantNodeEndpoints:    util.PortToNodeToLBEndpoints{}, // no local endpoints
+		},
+		{
+			name: "slice with one local endpoint",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: &tcp,
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2"),
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2"}, []string{})}}, // one cluster-wide endpoint
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, // no need for local endpoints, service is not ETP or ITP local
+		},
+		{
+			name: "slice with one local endpoint, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: &tcp,
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2"),
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndETPLocal("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2"}, []string{})}}, // one cluster-wide endpoint
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): {nodeA: util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2"}, []string{})}}}, // ETP=local, one local endpoint
+		},
+		{
+			name: "slice with one non-local endpoint, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: &tcp,
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeB, "10.0.0.2"),
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndETPLocal("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2"}, []string{})}}, // one cluster-wide endpoint
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, // ETP=local but no local endpoint
+		},
+		{
+			name: "slice of address type FQDN",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: &tcp,
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeFQDN,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "example.com"),
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{},       // no endpoints
+			wantNodeEndpoints:    util.PortToNodeToLBEndpoints{}, // no local endpoint
+		},
+		{
+			name: "slice with one endpoint, OVN zone with two nodes, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: &tcp,
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeB, "10.0.0.2"),
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndETPLocal("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA, nodeB), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2"}, []string{})}}, // one cluster-wide endpoint
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): {nodeB: util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2"}, []string{})}}}, // endpoint on nodeB
+		},
+		{
+			name: "slice with different port name than the service",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example-wrong"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(8080)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2"),
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{},       // no cluster-wide endpoints
+			wantNodeEndpoints:    util.PortToNodeToLBEndpoints{}, // no local endpoints
+		},
+		{
+			name: "slice and service without a port name, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Protocol: &tcp,
+								Port:     ptr.To(int32(8080)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2"),
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndETPLocal("", 80, tcp), // port with no name
+				nodes: sets.New(nodeA),                                     // one-node zone
+
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, ""): util.LBEndpoints{newLBEndpointEntry(8080, []string{"10.0.0.2"}, []string{})}}, // one cluster-wide endpoint
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{
+				util.GetServicePortKey(tcp, ""): {nodeA: util.LBEndpoints{newLBEndpointEntry(8080, []string{"10.0.0.2"}, []string{})}}}, // one local endpoint
+		},
+		{
+			name: "slice with an IPv6 endpoint",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "2001:db2::2"),
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{}, []string{"2001:db2::2"})}}, // one cluster-wide endpoint
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, //  local endpoints not filled in, since service is not ETP or ITP local
+		},
+		{
+			name: "a slice with an IPv4 endpoint and a slice with an IPv6 endpoint (dualstack cluster), ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2"),
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "2001:db2::2"),
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndETPLocal("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2"}, []string{"2001:db2::2"})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): {nodeA: util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2"}, []string{"2001:db2::2"})}}},
+		},
+		{
+			name: "one slice with a duplicate address in the same endpoint",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2", "10.0.0.2"),
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2"}, []string{})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, // local endpoints not filled in, since service is not ETP or ITP local
+		},
+		{
+			name: "one slice with a duplicate address across two endpoints",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   []discovery.Endpoint{kubetest.MakeReadyEndpoint(nodeA, "10.0.0.2"), kubetest.MakeReadyEndpoint(nodeA, "10.0.0.2")},
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2"}, []string{})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, // local endpoints not filled in, since service is not ETP or ITP local
+		},
+		{
+			name: "multiples slices with a duplicate address, with both address being ready",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2", "10.1.1.2"),
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2", "10.2.2.2"),
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2", "10.1.1.2", "10.2.2.2"}, []string{})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, // local endpoints not filled in, since service is not ETP or ITP local
+		},
+		{
+			name: "multiples slices with different ports, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2", "10.1.1.2"),
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("other-port"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(8080)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.3", "10.2.2.3"),
+					},
+				},
+				svc:   getSampleServiceWithTwoPortsAndETPLocal("tcp-example", "other-port", 80, 8080, tcp, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2", "10.1.1.2"}, []string{})},
+				util.GetServicePortKey(tcp, "other-port"):  util.LBEndpoints{newLBEndpointEntry(8080, []string{"10.0.0.3", "10.2.2.3"}, []string{})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): {nodeA: util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2", "10.1.1.2"}, []string{})}},
+				util.GetServicePortKey(tcp, "other-port"):  {nodeA: util.LBEndpoints{newLBEndpointEntry(8080, []string{"10.0.0.3", "10.2.2.3"}, []string{})}}},
+		},
+		{
+			name: "multiples slices with different ports, OVN zone with two nodes, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2", "10.1.1.2"),
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("other-port"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(8080)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeB, "10.0.0.3", "10.2.2.3"),
+					},
+				},
+				svc:   getSampleServiceWithTwoPortsAndETPLocal("tcp-example", "other-port", 80, 8080, tcp, tcp),
+				nodes: sets.New(nodeA, nodeB), // zone with two nodes
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2", "10.1.1.2"}, []string{})},
+				util.GetServicePortKey(tcp, "other-port"):  util.LBEndpoints{newLBEndpointEntry(8080, []string{"10.0.0.3", "10.2.2.3"}, []string{})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): {nodeA: util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2", "10.1.1.2"}, []string{})}},
+				util.GetServicePortKey(tcp, "other-port"):  {nodeB: util.LBEndpoints{newLBEndpointEntry(8080, []string{"10.0.0.3", "10.2.2.3"}, []string{})}}},
+		},
+		{
+			name: "slice with a mix of ready and terminating (serving and non-serving) endpoints",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeReadyEndpoint(nodeA, "2001:db2::2"),
+							kubetest.MakeReadyEndpoint(nodeA, "2001:db2::3"),
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "2001:db2::4"),
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "2001:db2::5"),
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::6"), // ignored
+						},
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{}, []string{"2001:db2::2", "2001:db2::3"})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, // local endpoints not filled in, since service is not ETP or ITP local
+		},
+		{
+			name: "slice with a mix of terminating (serving and non-serving) endpoints and no ready endpoints",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "2001:db2::4"),
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "2001:db2::5"),
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::6"),
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::7"),
+						},
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{}, []string{"2001:db2::4", "2001:db2::5"})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, // local endpoints not filled in, since service is not ETP or ITP local
+		},
+		{
+			name: "slice with only terminating non-serving endpoints",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::6"),
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::7"),
+						},
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{},       // no cluster-wide endpoints
+			wantNodeEndpoints:    util.PortToNodeToLBEndpoints{}, // local endpoints not filled in, since service is not ETP or ITP local
+
+		},
+		{
+			name: "multiple slices with a mix of terminating (serving and non-serving) endpoints and no ready endpoints",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::2"), // ignored
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "2001:db2::3"),
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "2001:db2::4"),
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::5"), // ignored
+						},
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{}, []string{"2001:db2::3", "2001:db2::4"})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, // local endpoints not filled in, since service is not ETP or ITP local
+		},
+		{
+			name: "multiple slices with only terminating non-serving endpoints",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::2"),
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::5"),
+						},
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{},       // no cluster-wide endpoints
+			wantNodeEndpoints:    util.PortToNodeToLBEndpoints{}, // no local endpoints
+
+		},
+		{
+			name: "multiple slices with a mix of IPv4 and IPv6 ready and terminating (serving and non-serving) endpoints (dualstack cluster)",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeReadyEndpoint(nodeA, "10.0.0.2"),
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "10.0.0.3"),
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "10.0.0.4"), // ignored
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeReadyEndpoint(nodeA, "2001:db2::2"),
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "2001:db2::3"),
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::4"), // ignored
+						},
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2"}, []string{"2001:db2::2"})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, // local endpoints not filled in, since service is not ETP or ITP local
+		},
+		{
+			name: "multiple slices with a mix of IPv4 and IPv6 terminating (serving and non-serving) endpoints and no ready endpoints (dualstack cluster)",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "10.0.0.3"),
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "10.0.0.4"),
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "2001:db2::3"),
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::4"),
+						},
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.3"}, []string{"2001:db2::3"})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, // local endpoints not filled in, since service is not ETP or ITP local
+		},
+		{
+			name: "multiple slices with a mix of IPv4 and IPv6 terminating non-serving endpoints (dualstack cluster)",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "10.0.0.4"), // ignored
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::4"), // ignored
+						},
+					},
+				},
+				svc:   getSampleServiceWithOnePort("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{},       // no endpoints
+			wantNodeEndpoints:    util.PortToNodeToLBEndpoints{}, // no endpoints
+		},
+		{
+			name: "multiple slices with a mix of IPv4 and IPv6 ready and terminating (serving and non-serving) endpoints (dualstack cluster) and service.PublishNotReadyAddresses=true",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeReadyEndpoint(nodeA, "10.0.0.2"),                 // included
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "10.0.0.3"),    // included
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "10.0.0.4"), // included
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv6,
+						Endpoints: []discovery.Endpoint{
+							kubetest.MakeReadyEndpoint(nodeA, "2001:db2::2"),                 // included
+							kubetest.MakeTerminatingServingEndpoint(nodeA, "2001:db2::3"),    // included
+							kubetest.MakeTerminatingNonServingEndpoint(nodeA, "2001:db2::4"), // included
+						},
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndPublishNotReadyAddresses("tcp-example", 80, tcp), // <-- publishNotReadyAddresses=true
+				nodes: sets.New(nodeA),                                                                // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2", "10.0.0.3", "10.0.0.4"},
+					[]string{"2001:db2::2", "2001:db2::3", "2001:db2::4"})}},
+
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{}, // local endpoints not filled in, since service is not ETP or ITP local
+		},
+		// Multiple slices with same port name but different port numbers.
+		// SDN-3551: both target ports are now supported during rolling updates.
+		{
+			name: "multiple slices with same port name, different ports, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2", "10.1.1.2"),
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(8080)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.3", "10.2.2.3"),
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndETPLocal("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): {
+					newLBEndpointEntry(80, []string{"10.0.0.2", "10.1.1.2"}, []string{}),
+					newLBEndpointEntry(8080, []string{"10.0.0.3", "10.2.2.3"}, []string{}),
+				}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): {nodeA: util.LBEndpoints{
+					newLBEndpointEntry(80, []string{"10.0.0.2", "10.1.1.2"}, []string{}),
+					newLBEndpointEntry(8080, []string{"10.0.0.3", "10.2.2.3"}, []string{}),
+				}}},
+		},
+		// The following is not supported by Kubernetes - OVNK will just ignore this and look up the matching
+		// protocol (TCP) only.
+		{
+			name: "multiple slices with same port name, different protocols, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2", "10.1.1.2"),
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolUDP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.3", "10.2.2.3"),
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndETPLocal("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2", "10.1.1.2"}, []string{})}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): {nodeA: util.LBEndpoints{newLBEndpointEntry(80, []string{"10.0.0.2", "10.1.1.2"}, []string{})}}},
+		},
+		// The following should never happen in k8s - endpoints should not be empty.
+		{
+			name: "multiple slices with same port name, empty endpoints, invalid ports, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   []discovery.Endpoint{kubetest.MakeUnassignedEndpoint("10.1.1.2")},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   []discovery.Endpoint{},
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndETPLocal("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA), // one-node zone
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{"TCP/tcp-example": util.LBEndpoints{newLBEndpointEntry(80, []string{"10.1.1.2"}, []string{})}},
+			wantNodeEndpoints:    util.PortToNodeToLBEndpoints{},
+		},
+
+		{
+			name: "multiple slices, service selects correct slice, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.1.1.2"),
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example2"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.1.1.3"),
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndETPLocal("tcp-example2", 80, tcp),
+				nodes: sets.New(nodeA),
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				"TCP/tcp-example2": util.LBEndpoints{newLBEndpointEntry(80, []string{"10.1.1.3"}, []string{})},
+			},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{
+				"TCP/tcp-example2": {nodeA: util.LBEndpoints{newLBEndpointEntry(80, []string{"10.1.1.3"}, []string{})}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			needsLocal := util.ServiceExternalTrafficPolicyLocal(tt.args.svc) || util.ServiceInternalTrafficPolicyLocal(tt.args.svc)
+			portToClusterEndpoints, portToNodeToEndpoints, err := util.GetEndpointsForService(
+				tt.args.slices, tt.args.svc, tt.args.nodes, true, needsLocal)
+			if err != nil {
+				t.Logf("GetEndpointsForService returned non-fatal error: %v", err)
+			}
+			assert.Equal(t, tt.wantClusterEndpoints, portToClusterEndpoints)
+			assert.Equal(t, tt.wantNodeEndpoints, portToNodeToEndpoints)
+		})
+	}
+}
+
+// Test_utilGetEndpointsForService tests util.GetEndpointsForService for additional scenarios.
+// These include nil service handling, port validation, and multi-port error reporting.
+func Test_utilGetEndpointsForService(t *testing.T) {
+	type args struct {
+		slices []*discovery.EndpointSlice
+		svc    *corev1.Service
+		nodes  sets.Set[string]
+	}
+
+	tests := []struct {
+		name                 string
+		args                 args
+		wantClusterEndpoints util.PortToLBEndpoints
+		wantNodeEndpoints    util.PortToNodeToLBEndpoints
+		wantError            error
+	}{
+		{
+			name: "multiple slices with same port name, different ports, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.2", "10.1.1.2"),
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab24",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(8080)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.0.0.3", "10.2.2.3"),
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndETPLocal("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA),
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): {
+					{V4IPs: []string{"10.0.0.2", "10.1.1.2"}, V6IPs: []string(nil), Port: 80},
+					{V4IPs: []string{"10.0.0.3", "10.2.2.3"}, V6IPs: []string(nil), Port: 8080},
+				}},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{
+				util.GetServicePortKey(tcp, "tcp-example"): {nodeA: util.LBEndpoints{
+					{V4IPs: []string{"10.0.0.2", "10.1.1.2"}, V6IPs: []string(nil), Port: 80},
+					{V4IPs: []string{"10.0.0.3", "10.2.2.3"}, V6IPs: []string(nil), Port: 8080},
+				}}},
+		},
+		{
+			name: "single slices, invalid port number, ETP=local",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(-2)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   []discovery.Endpoint{kubetest.MakeUnassignedEndpoint("10.1.1.2")},
+					},
+				},
+				svc:   getSampleServiceWithOnePortAndETPLocal("tcp-example", 80, tcp),
+				nodes: sets.New(nodeA),
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{},
+			wantNodeEndpoints:    util.PortToNodeToLBEndpoints{},
+		},
+		{
+			name: "nil service without endpoints",
+			args: args{
+				slices: []*discovery.EndpointSlice{},
+				svc:    nil,
+				nodes:  sets.New(nodeA),
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{},
+			wantNodeEndpoints:    util.PortToNodeToLBEndpoints{},
+		},
+		{
+			name: "multiple slices, nil service with endpoints",
+			args: args{
+				slices: []*discovery.EndpointSlice{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.1.1.2"),
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "svc-ab23",
+							Namespace: "ns",
+							Labels:    map[string]string{discovery.LabelServiceName: "svc"},
+						},
+						Ports: []discovery.EndpointPort{
+							{
+								Name:     ptr.To("tcp-example2"),
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(int32(80)),
+							},
+						},
+						AddressType: discovery.AddressTypeIPv4,
+						Endpoints:   kubetest.MakeReadyEndpointList(nodeA, "10.1.1.3"),
+					},
+				},
+				svc:   nil,
+				nodes: sets.New(nodeA),
+			},
+			wantClusterEndpoints: util.PortToLBEndpoints{
+				"TCP/tcp-example":  util.LBEndpoints{{Port: 80, V4IPs: []string{"10.1.1.2"}, V6IPs: []string(nil)}},
+				"TCP/tcp-example2": util.LBEndpoints{{Port: 80, V4IPs: []string{"10.1.1.3"}, V6IPs: []string(nil)}},
+			},
+			wantNodeEndpoints: util.PortToNodeToLBEndpoints{
+				"TCP/tcp-example":  util.PortToLBEndpoints{"node-a": {{Port: 80, V4IPs: []string{"10.1.1.2"}, V6IPs: []string(nil)}}},
+				"TCP/tcp-example2": util.PortToLBEndpoints{"node-a": {{Port: 80, V4IPs: []string{"10.1.1.3"}, V6IPs: []string(nil)}}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			needsLocalEndpoints := tt.args.svc == nil || util.ServiceExternalTrafficPolicyLocal(tt.args.svc) || util.ServiceInternalTrafficPolicyLocal(tt.args.svc)
+			portToClusterEndpoints, portToNodeToEndpoints, err := util.GetEndpointsForService(
+				tt.args.slices, tt.args.svc, tt.args.nodes, true, needsLocalEndpoints)
+			assert.Equal(t, tt.wantClusterEndpoints, portToClusterEndpoints)
+			assert.Equal(t, tt.wantNodeEndpoints, portToNodeToEndpoints)
+			if tt.wantError == nil {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tt.wantError.Error())
+			}
+		})
+	}
+}
+
+func Test_makeNodeSwitchTargetIPs(t *testing.T) {
+	tc := []struct {
+		name                string
+		config              *lbConfig
+		node                string
+		expectedTargetIPsV4 []string
+		expectedTargetIPsV6 []string
+		expectedV4Changed   bool
+		expectedV6Changed   bool
+	}{
+		{
+			name: "cluster ip service", //ETP=cluster by default on all services
+			config: &lbConfig{
+				vips:             []string{"1.2.3.4", "fe10::1"},
+				protocol:         corev1.ProtocolTCP,
+				inport:           80,
+				clusterEndpoints: util.LBEndpoints{{Port: 8080, V4IPs: []string{"192.168.0.1"}, V6IPs: []string{"fe00:0:0:0:1::2"}}},
+				nodeEndpoints: util.PortToLBEndpoints{
+					nodeA: {{Port: 8080, V4IPs: []string{"192.168.0.1"}, V6IPs: []string{"fe00:0:0:0:1::2"}}},
+				},
+			},
+			node:                nodeA,
+			expectedTargetIPsV4: []string{"192.168.0.1"},
+			expectedTargetIPsV6: []string{"fe00:0:0:0:1::2"},
+			expectedV4Changed:   false,
+			expectedV6Changed:   false,
+		},
+		{
+			name: "service with ETP=local, endpoint count changes",
+			config: &lbConfig{
+				vips:     []string{"1.2.3.4", "fe10::1"},
+				protocol: corev1.ProtocolTCP,
+				inport:   80,
+				clusterEndpoints: util.LBEndpoints{{Port: 8080,
+					V4IPs: []string{"192.168.0.1", "192.168.1.1"},
+					V6IPs: []string{"fe00:0:0:0:1::2", "fe00:0:0:0:2::2"}}},
+				nodeEndpoints: util.PortToLBEndpoints{
+					nodeA: {{Port: 8080, V4IPs: []string{"192.168.0.1"}, V6IPs: []string{"fe00:0:0:0:1::2"}}},
+				},
+				externalTrafficLocal: true,
+			},
+			node:                nodeA,
+			expectedTargetIPsV4: []string{"192.168.0.1"}, // only the endpoint on nodeA is kept
+			expectedTargetIPsV6: []string{"fe00:0:0:0:1::2"},
+			expectedV4Changed:   true,
+			expectedV6Changed:   true,
+		},
+		{
+			name: "service with ETP=local, endpoint count is the same",
+			config: &lbConfig{
+				vips:     []string{"1.2.3.4", "fe10::1"},
+				protocol: corev1.ProtocolTCP,
+				inport:   80,
+				clusterEndpoints: util.LBEndpoints{{Port: 8080,
+					V4IPs: []string{"192.168.0.1"},
+					V6IPs: []string{"fe00:0:0:0:1::2"},
+				}},
+				nodeEndpoints: util.PortToLBEndpoints{
+					nodeA: {{Port: 8080, V4IPs: []string{"192.168.0.1"}, V6IPs: []string{"fe00:0:0:0:1::2"}}},
+				},
+				externalTrafficLocal: true,
+			},
+			node:                nodeA,
+			expectedTargetIPsV4: []string{"192.168.0.1"},
+			expectedTargetIPsV6: []string{"fe00:0:0:0:1::2"},
+			expectedV4Changed:   false,
+		},
+		{
+			name: "service with ETP=local, no local endpoints left",
+			config: &lbConfig{
+				vips:     []string{"1.2.3.4", "fe10::1"},
+				protocol: corev1.ProtocolTCP,
+				inport:   80,
+				clusterEndpoints: util.LBEndpoints{{Port: 8080,
+					V4IPs: []string{"192.168.1.1"},     // on nodeB
+					V6IPs: []string{"fe00:0:0:0:2::2"}, // on nodeB
+				}},
+				// nothing on nodeA
+				externalTrafficLocal: true,
+			},
+			node:                nodeA,
+			expectedTargetIPsV4: []string{},
+			expectedTargetIPsV6: []string{}, // no local endpoints
+			expectedV4Changed:   true,
+			expectedV6Changed:   true,
+		},
+	}
+	for i, tt := range tc {
+		t.Run(fmt.Sprintf("%d_%s", i, tt.name), func(t *testing.T) {
+			actualTargetIPsV4, actualTargetIPsV6, actualV4Changed, actualV6Changed := makeNodeSwitchTargetIPs(tt.node, tt.config.clusterEndpoints.GetEntryByPort(8080), tt.config)
+			assert.Equal(t, tt.expectedTargetIPsV4, actualTargetIPsV4)
+			assert.Equal(t, tt.expectedTargetIPsV6, actualTargetIPsV6)
+			assert.Equal(t, tt.expectedV4Changed, actualV4Changed)
+			assert.Equal(t, tt.expectedV6Changed, actualV6Changed)
+
+		})
+	}
+}
