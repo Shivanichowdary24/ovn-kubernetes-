@@ -408,9 +408,13 @@ func (allocator *allocator) ReleaseIPs(name string, ips []*net.IPNet) error {
 	return nil
 }
 
-// ConditionalIPRelease determines if any IP is available to be released from an IPAM conditionally if func is true.
-// It guarantees state of the allocator will not change while executing the predicate function
-// TODO(trozet): add unit testing for this function
+//	ConditionalIPRelease checks whether any of the provided IPs are currently
+//
+// allocated for the named subnet. If an allocated IP is found, it evaluates
+// the predicate while holding the allocator read lock and returns the
+// predicate result.
+//
+// ConditionalIPRelease does not release the IP itself.
 func (allocator *allocator) ConditionalIPRelease(name string, ips []*net.IPNet, predicate func() (bool, error)) (bool, error) {
 	allocator.RLock()
 	defer allocator.RUnlock()
